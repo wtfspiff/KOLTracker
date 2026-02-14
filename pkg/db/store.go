@@ -565,6 +565,30 @@ func (s *Store) InsertFundingMatch(fm FundingFlowMatch) error {
 	return err
 }
 
+func (s *Store) GetFundingMatches(limit int) ([]FundingFlowMatch, error) {
+	rows, err := s.db.Query(`SELECT id, source_tx, source_chain, source_amount, source_token,
+		dest_address, dest_chain, dest_amount, dest_token, service,
+		amount_diff_pct, time_diff_seconds, match_confidence, created_at
+		FROM funding_flow_matches ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var matches []FundingFlowMatch
+	for rows.Next() {
+		var fm FundingFlowMatch
+		err := rows.Scan(&fm.ID, &fm.SourceTx, &fm.SourceChain, &fm.SourceAmount, &fm.SourceToken,
+			&fm.DestAddress, &fm.DestChain, &fm.DestAmount, &fm.DestToken,
+			&fm.Service, &fm.AmountDiffPct, &fm.TimeDiffSeconds, &fm.MatchConfidence, &fm.CreatedAt)
+		if err != nil {
+			continue
+		}
+		matches = append(matches, fm)
+	}
+	return matches, nil
+}
+
 // ---- Stats ----
 
 func (s *Store) GetStats() (map[string]int64, error) {

@@ -26,6 +26,7 @@ type Dashboard struct {
 	twitterMon  *twitter.Monitor
 	telegramMon *telegram.Monitor
 	studyEngine *scanner.WalletStudyEngine
+	aiInfo      func() map[string]interface{} // returns AI provider info
 }
 
 func New(store *db.Store, cfg *config.Config, port int) *Dashboard {
@@ -40,6 +41,10 @@ func (d *Dashboard) SetMonitors(tw *twitter.Monitor, tg *telegram.Monitor, study
 	d.studyEngine = study
 }
 
+func (d *Dashboard) SetAIInfo(fn func() map[string]interface{}) {
+	d.aiInfo = fn
+}
+
 func (d *Dashboard) Run() error {
 	mux := http.NewServeMux()
 
@@ -52,6 +57,7 @@ func (d *Dashboard) Run() error {
 	mux.HandleFunc("/api/alerts", cors(d.handleAlerts))
 	mux.HandleFunc("/api/funding-matches", cors(d.handleFundingMatches))
 	mux.HandleFunc("/api/kol/", cors(d.handleKOLDetail))
+	mux.HandleFunc("/api/ai/info", cors(d.handleAIInfo))
 
 	mux.HandleFunc("/", d.serveFrontend)
 
@@ -288,7 +294,20 @@ func (d *Dashboard) handleAlerts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Dashboard) handleFundingMatches(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, []interface{}{})
+	matches, err := d.store.GetFundingMatches(100)
+	if err != nil || matches == nil {
+		writeJSON(w, []interface{}{})
+		return
+	}
+	writeJSON(w, matches)
+}
+
+func (d *Dashboard) handleAIInfo(w http.ResponseWriter, r *http.Request) {
+	if d.aiInfo != nil {
+		writeJSON(w, d.aiInfo())
+	} else {
+		writeJSON(w, map[string]interface{}{"enabled": false})
+	}
 }
 
 func (d *Dashboard) handleKOLDetail(w http.ResponseWriter, r *http.Request) {

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -304,4 +303,4 @@ func avg(v []float64) float64 { if len(v)==0{return 0}; s:=0.0; for _,x:=range v
 func topKey(m map[string]int) string { t,mx:="",0; for k,v:=range m{if v>mx{t,mx=k,v}}; return t }
 func safePct(n,t int) float64 { if t==0{return 0}; return float64(n)/float64(t)*100 }
 func abbrev(a string) string { if len(a)>12{return a[:6]+"..."+a[len(a)-4:]}; return a }
-func _unused(){_=strings.Contains;_=log.Info}
+

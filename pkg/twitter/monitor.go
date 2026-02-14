@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -49,7 +50,7 @@ func (m *Monitor) Login() error {
 	// Priority 1: Use saved cookies from file
 	if m.cfg.TwitterCookieFile != "" {
 		if data, err := os.ReadFile(m.cfg.TwitterCookieFile); err == nil {
-			var cookies []*twitterscraper.Cookie
+			var cookies []*http.Cookie
 			if json.Unmarshal(data, &cookies) == nil && len(cookies) > 0 {
 				m.scraper.SetCookies(cookies)
 				if m.scraper.IsLoggedIn() {

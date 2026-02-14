@@ -1,7 +1,6 @@
 package scanner
 
 import (
-	"fmt"
 	"math"
 	"math/big"
 	"strconv"
@@ -69,9 +68,3 @@ func matchServiceLabel(label string) string {
 	return "unknown"
 }
 
-// unused suppresses import errors during development
-func _unused() {
-	_ = fmt.Sprintf
-	_ = math.Abs
-	_ = big.NewFloat
-}

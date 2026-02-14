@@ -79,6 +79,7 @@ func main() {
 
 	dash := dashboard.New(store, cfg, cfg.DashboardPort)
 	dash.SetMonitors(twitterMon, telegramMon, studyEngine)
+	dash.SetAIInfo(aiEngine.GetProviderInfo)
 	go func() { errCh <- dash.Run() }()
 
 	printSummary(cfg, store)
@@ -136,10 +137,18 @@ func printSummary(cfg *config.Config, store *db.Store) {
 	fmt.Printf("  Telegram:  %v\n", cfg.KOLTelegramChannels)
 	fmt.Printf("  Chains:    Solana, Ethereum, Base, BSC\n")
 	fmt.Printf("  Dashboard: http://localhost:%d\n", cfg.DashboardPort)
-	aiStatus := "❌ Disabled (set ANTHROPIC_API_KEY or OPENAI_API_KEY)"
-	if cfg.AnthropicAPIKey != "" { aiStatus = "✅ Anthropic Claude" }
-	if cfg.OpenAIAPIKey != "" { aiStatus = "✅ OpenAI" }
-	if cfg.OllamaURL != "" { aiStatus = "✅ Ollama (local)" }
+	aiStatus := "❌ Disabled (set AI_PROVIDER + credentials)"
+	if cfg.AnthropicAPIKey != "" {
+		model := cfg.AIModel; if model == "" { model = "claude-sonnet-4-20250514" }
+		modelFast := cfg.AIModelFast; if modelFast == "" { modelFast = "claude-haiku-4-5-20251001" }
+		aiStatus = fmt.Sprintf("✅ Anthropic (primary: %s, fast: %s)", model, modelFast)
+	} else if cfg.OllamaURL != "" {
+		model := cfg.AIModel; if model == "" { model = cfg.OllamaModel }
+		aiStatus = fmt.Sprintf("✅ Ollama @ %s (model: %s)", cfg.OllamaURL, model)
+	} else if cfg.OpenAIAPIKey != "" {
+		model := cfg.AIModel; if model == "" { model = "gpt-4o" }
+		aiStatus = fmt.Sprintf("✅ OpenAI (model: %s)", model)
+	}
 	fmt.Printf("  AI Engine: %s\n", aiStatus)
 	if stats != nil { fmt.Printf("  DB: %d KOLs, %d wallets, %d txs\n", stats["kol_profiles"], stats["tracked_wallets"], stats["wallet_transactions"]) }
 	fmt.Println(strings.Repeat("═", 60) + "\n")

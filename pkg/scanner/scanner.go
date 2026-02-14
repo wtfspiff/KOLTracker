@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -53,7 +56,10 @@ func (s *Scanner) GetRecentTokenBuyers(ctx context.Context, tokenAddr string, ch
 	if chain == config.ChainSolana && s.cfg.BirdeyeAPIKey != "" {
 		return s.birdeyeBuyers(ctx, tokenAddr)
 	}
-	// EVM and fallback: use DexScreener (limited - no individual buyers)
+	// EVM: query recent token transfer events from block explorer
+	if strings.HasPrefix(tokenAddr, "0x") {
+		return s.evmTokenBuyers(ctx, tokenAddr, chain)
+	}
 	return nil, nil
 }
 
@@ -138,7 +144,7 @@ func (s *Scanner) scanSolana(ctx context.Context, walletID int64, address string
 		for _, nt := range p.NativeTransfers {
 			sol := float64(nt.Amount) / 1e9
 			if nt.FromUserAccount == address || nt.ToUserAccount == address {
-				tx.AmountUSD = sol * 150 // TODO: live SOL price
+				tx.AmountUSD = sol * s.getSolPrice(ctx)
 			}
 		}
 
@@ -326,6 +332,7 @@ func (s *Scanner) scanEVM(ctx context.Context, walletID int64, address string, c
 	}
 
 	native := nativeSymbol(chain)
+	nativePrice := s.getNativePrice(ctx, chain)
 	count := 0
 
 	// Normal txs
@@ -347,7 +354,7 @@ func (s *Scanner) scanEVM(ctx context.Context, walletID int64, address string, c
 
 		if s.store.InsertTransaction(db.WalletTransaction{
 			WalletID: walletID, TxHash: hash, Chain: chain, TxType: txType,
-			TokenSymbol: native, AmountToken: value,
+			TokenSymbol: native, AmountToken: value, AmountUSD: value * nativePrice,
 			FromAddress: from, ToAddress: to, Timestamp: ts,
 			BlockNumber: parseInt64(str(etx, "blockNumber")),
 		}) == nil {
@@ -383,10 +390,16 @@ func (s *Scanner) scanEVM(ctx context.Context, walletID int64, address string, c
 			txType = "swap_sell"
 		}
 
+		// For stablecoins, AmountUSD ≈ AmountToken; for others, skip (no price)
+		amountUSD := 0.0
+		if stables[symbol] {
+			amountUSD = value
+		}
+
 		if s.store.InsertTransaction(db.WalletTransaction{
 			WalletID: walletID, TxHash: hash, Chain: chain, TxType: txType,
 			TokenAddress: str(etx, "contractAddress"), TokenSymbol: symbol,
-			AmountToken: value, FromAddress: from, ToAddress: to,
+			AmountToken: value, AmountUSD: amountUSD, FromAddress: from, ToAddress: to,
 			Timestamp: parseUnixStr(str(etx, "timeStamp")),
 		}) == nil {
 			count++
@@ -546,9 +559,10 @@ func (s *Scanner) getJSON(ctx context.Context, url string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	var buf [1 << 20]byte // 1MB max
-	n, _ := resp.Body.Read(buf[:])
-	return buf[:n], nil
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10MB max
 }
 
 func str(m map[string]interface{}, key string) string {
@@ -561,4 +575,174 @@ func nativeSymbol(chain config.Chain) string {
 		return "BNB"
 	}
 	return "ETH"
+}
+
+// ── Live Price Fetching ─────────────────────────────────────
+
+var (
+	priceCache     = map[string]cachedPrice{}
+	priceCacheLock sync.RWMutex
+)
+
+type cachedPrice struct {
+	price   float64
+	fetched time.Time
+}
+
+// getSolPrice returns the current SOL/USD price via DexScreener (free, no API key).
+// Caches for 60 seconds to avoid rate limits.
+func (s *Scanner) getSolPrice(ctx context.Context) float64 {
+	return s.getTokenPrice(ctx, "solana", "So11111111111111111111111111111111111111112")
+}
+
+// getETHPrice returns the current ETH/USD price.
+func (s *Scanner) getETHPrice(ctx context.Context) float64 {
+	return s.getTokenPrice(ctx, "ethereum", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+}
+
+// getBNBPrice returns the current BNB/USD price.
+func (s *Scanner) getBNBPrice(ctx context.Context) float64 {
+	return s.getTokenPrice(ctx, "bsc", "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")
+}
+
+// getNativePrice returns the native token price for any chain.
+func (s *Scanner) getNativePrice(ctx context.Context, chain config.Chain) float64 {
+	switch chain {
+	case config.ChainSolana:
+		return s.getSolPrice(ctx)
+	case config.ChainBSC:
+		return s.getBNBPrice(ctx)
+	default: // ETH, Base (uses ETH)
+		return s.getETHPrice(ctx)
+	}
+}
+
+// getTokenPrice fetches from DexScreener with 60s cache.
+func (s *Scanner) getTokenPrice(ctx context.Context, dexChain, tokenAddr string) float64 {
+	cacheKey := dexChain + ":" + tokenAddr
+
+	priceCacheLock.RLock()
+	if c, ok := priceCache[cacheKey]; ok && time.Since(c.fetched) < 60*time.Second {
+		priceCacheLock.RUnlock()
+		return c.price
+	}
+	priceCacheLock.RUnlock()
+
+	url := fmt.Sprintf("https://api.dexscreener.com/latest/dex/tokens/%s", tokenAddr)
+	body, err := s.getJSON(ctx, url)
+	if err != nil {
+		return fallbackPrice(dexChain)
+	}
+
+	var result struct {
+		Pairs []struct {
+			PriceUSD    string `json:"priceUsd"`
+			ChainID     string `json:"chainId"`
+			Liquidity   struct{ USD float64 `json:"usd"` } `json:"liquidity"`
+		} `json:"pairs"`
+	}
+	if json.Unmarshal(body, &result) != nil || len(result.Pairs) == 0 {
+		return fallbackPrice(dexChain)
+	}
+
+	// Pick highest liquidity pair
+	bestPrice := 0.0
+	bestLiq := 0.0
+	for _, p := range result.Pairs {
+		if price := parseFloat(p.PriceUSD); price > 0 && p.Liquidity.USD > bestLiq {
+			bestPrice = price
+			bestLiq = p.Liquidity.USD
+		}
+	}
+
+	if bestPrice > 0 {
+		priceCacheLock.Lock()
+		priceCache[cacheKey] = cachedPrice{price: bestPrice, fetched: time.Now()}
+		priceCacheLock.Unlock()
+		return bestPrice
+	}
+
+	return fallbackPrice(dexChain)
+}
+
+func fallbackPrice(chain string) float64 {
+	// Conservative fallback prices if API is down
+	switch chain {
+	case "solana":
+		return 150.0
+	case "ethereum":
+		return 2500.0
+	case "bsc":
+		return 300.0
+	default:
+		return 2500.0
+	}
+}
+
+func parseFloat(s string) float64 {
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
+}
+
+// ── EVM Token Buyers ────────────────────────────────────────
+
+// evmTokenBuyers fetches recent buyers of an ERC-20 token using Etherscan/Basescan token transfer API.
+func (s *Scanner) evmTokenBuyers(ctx context.Context, tokenAddr string, chain config.Chain) ([]TokenBuyer, error) {
+	apiURL := s.cfg.GetExplorerURL(chain)
+	apiKey := s.cfg.GetExplorerKey(chain)
+	if apiURL == "" || apiKey == "" {
+		return nil, fmt.Errorf("no explorer config for %s", chain)
+	}
+
+	// Fetch recent token transfers for this contract
+	url := fmt.Sprintf("%s?module=account&action=tokentx&contractaddress=%s&page=1&offset=100&sort=desc&apikey=%s",
+		apiURL, tokenAddr, apiKey)
+
+	body, err := s.getJSON(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Status string            `json:"status"`
+		Result []etherscanResult `json:"result"`
+	}
+	json.Unmarshal(body, &result)
+	if result.Status != "1" {
+		return nil, fmt.Errorf("explorer status: %s", result.Status)
+	}
+
+	// Deduplicate buyers (wallets that received the token)
+	seen := map[string]bool{}
+	var buyers []TokenBuyer
+
+	for _, tx := range result.Result {
+		to := str(tx, "to")
+		from := str(tx, "from")
+		if to == "" || seen[strings.ToLower(to)] {
+			continue
+		}
+
+		// Skip if "to" is a known DEX router or contract
+		// A buy = the wallet received tokens FROM a DEX/router
+		// We want the "to" address as the buyer
+		decimals := int(parseInt64(str(tx, "tokenDecimal")))
+		if decimals == 0 {
+			decimals = 18
+		}
+		value := tokenValue(str(tx, "value"), decimals)
+		ts := parseUnixStr(str(tx, "timeStamp"))
+
+		seen[strings.ToLower(to)] = true
+		buyers = append(buyers, TokenBuyer{
+			Address:   to,
+			AmountUSD: value, // token amount, not USD (would need price lookup)
+			TxHash:    str(tx, "hash"),
+			Timestamp: ts,
+			Source:    fmt.Sprintf("from:%s", abbrev(from)),
+			Chain:     chain,
+		})
+	}
+
+	return buyers, nil
 }

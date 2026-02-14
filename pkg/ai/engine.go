@@ -16,50 +16,237 @@ import (
 	"github.com/kol-tracker/pkg/db"
 )
 
-// Engine wraps an LLM (Claude / OpenAI / local) to provide intelligent analysis
-// that goes far beyond regex + heuristics.
+// Engine wraps an LLM (Claude Sonnet/Haiku / Ollama / OpenAI) to provide intelligent analysis.
+// Supports per-task model routing: expensive tasks use the primary model,
+// cheaper tasks use the fast model (e.g., Haiku or a small Ollama model).
 type Engine struct {
 	cfg    *config.Config
 	store  *db.Store
 	client *http.Client
 
-	provider   string // "anthropic", "openai", "ollama"
-	apiKey     string
-	model      string
-	apiBaseURL string
+	provider      string // "anthropic", "openai", "ollama"
+	apiKey        string
+	model         string // primary model (complex tasks: wallet study, discovery)
+	modelFast     string // fast model (simple tasks: post analysis, reclassify)
+	apiBaseURL    string
+	ollamaBaseURL string // stored separately for multi-endpoint ollama
+	maxTokens     int
 }
+
+// Model presets for easy configuration
+const (
+	ModelSonnet = "claude-sonnet-4-20250514"
+	ModelHaiku  = "claude-haiku-4-5-20251001"
+	ModelGPT4o  = "gpt-4o"
+	ModelGPT4oMini = "gpt-4o-mini"
+
+	// Ollama models
+	OllamaLlama31     = "llama3.1"
+	OllamaLlama31_70B = "llama3.1:70b"
+	OllamaMistral      = "mistral"
+	OllamaDeepSeek     = "deepseek-r1"
+	OllamaQwen         = "qwen2.5"
+	OllamaGemma2       = "gemma2"
+)
 
 func NewEngine(cfg *config.Config, store *db.Store) *Engine {
 	e := &Engine{
-		cfg:    cfg,
-		store:  store,
-		client: &http.Client{Timeout: 120 * time.Second},
+		cfg:       cfg,
+		store:     store,
+		client:    &http.Client{Timeout: 180 * time.Second},
+		maxTokens: cfg.AIMaxTokens,
+	}
+	if e.maxTokens == 0 {
+		e.maxTokens = 4096
 	}
 
-	// Determine provider from config
-	if cfg.AnthropicAPIKey != "" {
-		e.provider = "anthropic"
-		e.apiKey = cfg.AnthropicAPIKey
-		e.model = envOr("AI_MODEL", "claude-sonnet-4-20250514")
-		e.apiBaseURL = "https://api.anthropic.com/v1/messages"
-	} else if cfg.OpenAIAPIKey != "" {
-		e.provider = "openai"
-		e.apiKey = cfg.OpenAIAPIKey
-		e.model = envOr("AI_MODEL", "gpt-4o")
-		e.apiBaseURL = "https://api.openai.com/v1/chat/completions"
-	} else if cfg.OllamaURL != "" {
-		e.provider = "ollama"
-		e.model = envOr("AI_MODEL", "llama3.1")
-		e.apiBaseURL = cfg.OllamaURL + "/api/chat"
+	// ── Resolve provider ──
+	// Priority: explicit AI_PROVIDER > auto-detect from API keys
+	provider := strings.ToLower(cfg.AIProvider)
+	switch provider {
+	case "anthropic":
+		e.setupAnthropic(cfg)
+	case "ollama":
+		e.setupOllama(cfg)
+	case "openai":
+		e.setupOpenAI(cfg)
+	default:
+		// Auto-detect from available credentials
+		if cfg.AnthropicAPIKey != "" {
+			e.setupAnthropic(cfg)
+		} else if cfg.OllamaURL != "" {
+			e.setupOllama(cfg)
+		} else if cfg.OpenAIAPIKey != "" {
+			e.setupOpenAI(cfg)
+		}
 	}
 
 	if e.provider != "" {
-		log.Info().Str("provider", e.provider).Str("model", e.model).Msg("🤖 AI engine initialized")
+		log.Info().
+			Str("provider", e.provider).
+			Str("model", e.model).
+			Str("model_fast", e.modelFast).
+			Msg("🤖 AI engine initialized")
 	} else {
-		log.Warn().Msg("⚠️ No AI provider configured - AI features disabled")
+		log.Warn().Msg("⚠️ No AI provider configured — AI features disabled")
+		log.Warn().Msg("   Set AI_PROVIDER=ollama + OLLAMA_URL=http://localhost:11434 for free local AI")
+		log.Warn().Msg("   Set ANTHROPIC_API_KEY for Claude Sonnet/Haiku")
 	}
 
 	return e
+}
+
+func (e *Engine) setupAnthropic(cfg *config.Config) {
+	e.provider = "anthropic"
+	e.apiKey = cfg.AnthropicAPIKey
+	e.apiBaseURL = "https://api.anthropic.com/v1/messages"
+
+	// Model resolution
+	e.model = cfg.AIModel
+	if e.model == "" {
+		e.model = ModelSonnet
+	}
+	e.modelFast = cfg.AIModelFast
+	if e.modelFast == "" {
+		// Default: Haiku for fast tasks (12x cheaper than Sonnet)
+		e.modelFast = ModelHaiku
+	}
+}
+
+func (e *Engine) setupOpenAI(cfg *config.Config) {
+	e.provider = "openai"
+	e.apiKey = cfg.OpenAIAPIKey
+	e.apiBaseURL = "https://api.openai.com/v1/chat/completions"
+
+	e.model = cfg.AIModel
+	if e.model == "" {
+		e.model = ModelGPT4o
+	}
+	e.modelFast = cfg.AIModelFast
+	if e.modelFast == "" {
+		e.modelFast = ModelGPT4oMini
+	}
+}
+
+func (e *Engine) setupOllama(cfg *config.Config) {
+	e.provider = "ollama"
+	url := cfg.OllamaURL
+	if url == "" {
+		url = "http://localhost:11434"
+	}
+	e.ollamaBaseURL = strings.TrimRight(url, "/")
+	e.apiBaseURL = e.ollamaBaseURL + "/api/chat"
+
+	e.model = cfg.AIModel
+	if e.model == "" {
+		if cfg.OllamaModel != "" {
+			e.model = cfg.OllamaModel
+		} else {
+			e.model = OllamaLlama31
+		}
+	}
+	e.modelFast = cfg.AIModelFast
+	if e.modelFast == "" {
+		e.modelFast = e.model // same model for Ollama (all free)
+	}
+
+	// Auto-pull model if enabled
+	if cfg.OllamaAutoStart {
+		e.ollamaEnsureModel(e.model)
+		if e.modelFast != e.model {
+			e.ollamaEnsureModel(e.modelFast)
+		}
+	}
+}
+
+// ollamaEnsureModel checks if a model is available locally, pulls it if not.
+func (e *Engine) ollamaEnsureModel(model string) {
+	// Check if model exists
+	checkURL := e.ollamaBaseURL + "/api/show"
+	reqBody, _ := json.Marshal(map[string]string{"name": model})
+	resp, err := e.client.Post(checkURL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		log.Warn().Err(err).Str("url", e.ollamaBaseURL).Msg("cannot connect to Ollama — is it running?")
+		log.Warn().Msgf("   Start with: ollama serve")
+		log.Warn().Msgf("   Then pull:  ollama pull %s", model)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		log.Info().Str("model", model).Msg("✅ Ollama model available")
+		return
+	}
+
+	// Model not found — pull it
+	log.Info().Str("model", model).Msg("📥 Pulling Ollama model (this may take a few minutes)...")
+
+	pullURL := e.ollamaBaseURL + "/api/pull"
+	pullBody, _ := json.Marshal(map[string]interface{}{
+		"name":   model,
+		"stream": false,
+	})
+
+	// Use a longer timeout for model downloads
+	pullClient := &http.Client{Timeout: 30 * time.Minute}
+	pullResp, err := pullClient.Post(pullURL, "application/json", bytes.NewReader(pullBody))
+	if err != nil {
+		log.Error().Err(err).Str("model", model).Msg("failed to pull Ollama model")
+		return
+	}
+	defer pullResp.Body.Close()
+
+	if pullResp.StatusCode == 200 {
+		log.Info().Str("model", model).Msg("✅ Ollama model pulled successfully")
+	} else {
+		body, _ := io.ReadAll(pullResp.Body)
+		log.Error().Int("status", pullResp.StatusCode).Str("body", string(body)).
+			Str("model", model).Msg("failed to pull Ollama model")
+	}
+}
+
+// OllamaListModels returns all locally available Ollama models.
+func (e *Engine) OllamaListModels() ([]string, error) {
+	if e.provider != "ollama" {
+		return nil, fmt.Errorf("not using Ollama")
+	}
+	resp, err := e.client.Get(e.ollamaBaseURL + "/api/tags")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var result struct {
+		Models []struct {
+			Name string `json:"name"`
+			Size int64  `json:"size"`
+		} `json:"models"`
+	}
+	json.Unmarshal(body, &result)
+
+	var names []string
+	for _, m := range result.Models {
+		names = append(names, m.Name)
+	}
+	return names, nil
+}
+
+// GetProviderInfo returns current AI configuration for dashboard display.
+func (e *Engine) GetProviderInfo() map[string]interface{} {
+	info := map[string]interface{}{
+		"enabled":    e.IsEnabled(),
+		"provider":   e.provider,
+		"model":      e.model,
+		"model_fast": e.modelFast,
+		"max_tokens": e.maxTokens,
+	}
+	if e.provider == "ollama" {
+		info["ollama_url"] = e.ollamaBaseURL
+		models, _ := e.OllamaListModels()
+		info["ollama_models"] = models
+	}
+	return info
 }
 
 func (e *Engine) IsEnabled() bool {
@@ -157,7 +344,7 @@ KEY ANALYSIS POINTS:
 
 Return ONLY valid JSON, no other text.`, kolName, post.Content, contextPosts)
 
-	resp, err := e.callLLM(ctx, prompt, "json")
+	resp, err := e.callLLMFast(ctx, prompt)
 	if err != nil {
 		return nil, err
 	}
@@ -747,7 +934,7 @@ Return JSON:
 
 Return ONLY valid JSON.`, kol.Name, profileSummaries.String())
 
-	resp, err := e.callLLM(ctx, prompt, "json")
+	resp, err := e.callLLMFast(ctx, prompt)
 	if err != nil {
 		return nil, err
 	}
@@ -787,26 +974,66 @@ type WalletUpdate struct {
 }
 
 // ============================================================================
-// LLM CALL ABSTRACTION (supports Anthropic, OpenAI, Ollama)
+// LLM CALL ABSTRACTION
+// Supports: Anthropic (Sonnet/Haiku), OpenAI, Ollama (any local model)
+// Features: model routing (fast vs primary), retry, token tracking
 // ============================================================================
 
+// TaskComplexity determines which model to use.
+type TaskComplexity int
+
+const (
+	TaskSimple  TaskComplexity = iota // post analysis, reclassify → fast model
+	TaskComplex                       // wallet study, discovery → primary model
+)
+
+// callLLM dispatches to the correct provider using the PRIMARY model.
 func (e *Engine) callLLM(ctx context.Context, prompt, format string) (string, error) {
-	switch e.provider {
-	case "anthropic":
-		return e.callAnthropic(ctx, prompt)
-	case "openai":
-		return e.callOpenAI(ctx, prompt)
-	case "ollama":
-		return e.callOllama(ctx, prompt)
-	default:
-		return "", fmt.Errorf("no AI provider configured")
-	}
+	return e.callWithModel(ctx, prompt, e.model)
 }
 
-func (e *Engine) callAnthropic(ctx context.Context, prompt string) (string, error) {
+// callLLMFast uses the FAST model for cheaper/simpler tasks.
+func (e *Engine) callLLMFast(ctx context.Context, prompt string) (string, error) {
+	return e.callWithModel(ctx, prompt, e.modelFast)
+}
+
+// callWithModel dispatches to the correct provider with a specific model.
+func (e *Engine) callWithModel(ctx context.Context, prompt, model string) (string, error) {
+	var resp string
+	var err error
+
+	for attempt := 0; attempt < 2; attempt++ {
+		switch e.provider {
+		case "anthropic":
+			resp, err = e.callAnthropic(ctx, prompt, model)
+		case "openai":
+			resp, err = e.callOpenAI(ctx, prompt, model)
+		case "ollama":
+			resp, err = e.callOllama(ctx, prompt, model)
+		default:
+			return "", fmt.Errorf("no AI provider configured")
+		}
+
+		if err == nil {
+			return resp, nil
+		}
+
+		// Retry on transient errors
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "overloaded") {
+			log.Warn().Err(err).Int("attempt", attempt+1).Msg("LLM rate limited, retrying...")
+			time.Sleep(time.Duration(5*(attempt+1)) * time.Second)
+			continue
+		}
+		break
+	}
+
+	return resp, err
+}
+
+func (e *Engine) callAnthropic(ctx context.Context, prompt, model string) (string, error) {
 	reqBody := map[string]interface{}{
-		"model":      e.model,
-		"max_tokens": 4096,
+		"model":      model,
+		"max_tokens": e.maxTokens,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
@@ -820,7 +1047,7 @@ func (e *Engine) callAnthropic(ctx context.Context, prompt string) (string, erro
 
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("anthropic request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -833,8 +1060,18 @@ func (e *Engine) callAnthropic(ctx context.Context, prompt string) (string, erro
 		Content []struct {
 			Text string `json:"text"`
 		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
 	}
 	json.Unmarshal(respBody, &result)
+
+	if result.Usage.InputTokens > 0 {
+		log.Debug().Str("model", model).
+			Int("in", result.Usage.InputTokens).Int("out", result.Usage.OutputTokens).
+			Msg("tokens used")
+	}
 
 	if len(result.Content) > 0 {
 		return result.Content[0].Text, nil
@@ -842,13 +1079,13 @@ func (e *Engine) callAnthropic(ctx context.Context, prompt string) (string, erro
 	return "", fmt.Errorf("empty response from anthropic")
 }
 
-func (e *Engine) callOpenAI(ctx context.Context, prompt string) (string, error) {
+func (e *Engine) callOpenAI(ctx context.Context, prompt, model string) (string, error) {
 	reqBody := map[string]interface{}{
-		"model": e.model,
+		"model": model,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
-		"max_tokens": 4096,
+		"max_tokens": e.maxTokens,
 	}
 
 	body, _ := json.Marshal(reqBody)
@@ -858,7 +1095,7 @@ func (e *Engine) callOpenAI(ctx context.Context, prompt string) (string, error) 
 
 	resp, err := e.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("openai request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -873,6 +1110,9 @@ func (e *Engine) callOpenAI(ctx context.Context, prompt string) (string, error) 
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage struct {
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 	json.Unmarshal(respBody, &result)
 
@@ -882,32 +1122,69 @@ func (e *Engine) callOpenAI(ctx context.Context, prompt string) (string, error) 
 	return "", fmt.Errorf("empty response from openai")
 }
 
-func (e *Engine) callOllama(ctx context.Context, prompt string) (string, error) {
+func (e *Engine) callOllama(ctx context.Context, prompt, model string) (string, error) {
 	reqBody := map[string]interface{}{
-		"model": e.model,
+		"model": model,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
 		"stream": false,
+		"options": map[string]interface{}{
+			"num_predict": e.maxTokens,
+			"temperature": 0.3, // lower temp for structured JSON output
+		},
 	}
 
 	body, _ := json.Marshal(reqBody)
+
+	// Ollama can be slow for large models — use extended timeout
+	ollamaClient := &http.Client{Timeout: 5 * time.Minute}
 	req, _ := http.NewRequestWithContext(ctx, "POST", e.apiBaseURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := e.client.Do(req)
+	resp, err := ollamaClient.Do(req)
 	if err != nil {
-		return "", err
+		if strings.Contains(err.Error(), "connection refused") {
+			return "", fmt.Errorf("Ollama not running at %s — start with: ollama serve", e.ollamaBaseURL)
+		}
+		return "", fmt.Errorf("ollama request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == 404 {
+		// Model not found — try to pull it
+		log.Warn().Str("model", model).Msg("model not found in Ollama, attempting pull...")
+		e.ollamaEnsureModel(model)
+		return "", fmt.Errorf("model %s not available, pulling now — retry in a few minutes", model)
+	}
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("ollama error %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	var result struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		TotalDuration  int64 `json:"total_duration"`
+		EvalCount      int   `json:"eval_count"`
+		PromptEvalCount int  `json:"prompt_eval_count"`
 	}
 	json.Unmarshal(respBody, &result)
+
+	if result.EvalCount > 0 {
+		durationSec := float64(result.TotalDuration) / 1e9
+		tokPerSec := float64(result.EvalCount) / durationSec
+		log.Debug().Str("model", model).
+			Int("prompt_tokens", result.PromptEvalCount).
+			Int("completion_tokens", result.EvalCount).
+			Float64("tok/s", tokPerSec).
+			Float64("duration_s", durationSec).
+			Msg("ollama inference")
+	}
+
 	return result.Message.Content, nil
 }
 
@@ -922,7 +1199,6 @@ func extractJSON(s string) []byte {
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
-	// Find JSON boundaries
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start >= 0 && end > start {
@@ -932,54 +1208,30 @@ func extractJSON(s string) []byte {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
+	if len(s) <= n { return s }
 	return s[:n] + "..."
 }
 
 func abbrev(a string) string {
-	if len(a) > 12 {
-		return a[:6] + "..." + a[len(a)-4:]
-	}
+	if len(a) > 12 { return a[:6] + "..." + a[len(a)-4:] }
 	return a
 }
 
 func avg(vals []float64) float64 {
-	if len(vals) == 0 {
-		return 0
-	}
+	if len(vals) == 0 { return 0 }
 	s := 0.0
-	for _, v := range vals {
-		s += v
-	}
+	for _, v := range vals { s += v }
 	return s / float64(len(vals))
 }
 
 func min(vals []float64) float64 {
 	m := vals[0]
-	for _, v := range vals[1:] {
-		if v < m {
-			m = v
-		}
-	}
+	for _, v := range vals[1:] { if v < m { m = v } }
 	return m
 }
 
 func max(vals []float64) float64 {
 	m := vals[0]
-	for _, v := range vals[1:] {
-		if v > m {
-			m = v
-		}
-	}
+	for _, v := range vals[1:] { if v > m { m = v } }
 	return m
-}
-
-func envOr(key, fallback string) string {
-	if v := fmt.Sprintf("%s", key); v != "" {
-		// This is a placeholder - actual env reading is in config
-		return fallback
-	}
-	return fallback
 }

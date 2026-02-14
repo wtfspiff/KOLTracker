@@ -93,11 +93,22 @@ type Config struct {
 	DashboardPort int
 
 	// AI / LLM
+	// AI_PROVIDER: "anthropic" | "ollama" | "openai" (explicit selection)
+	// If not set, auto-detects from available API keys
+	AIProvider      string
 	AnthropicAPIKey string
 	OpenAIAPIKey    string
-	OllamaURL       string
-	AIModel         string
+	OllamaURL       string // e.g. http://localhost:11434
+	OllamaModel     string // model name for ollama (e.g. "llama3.1", "mistral", "deepseek-r1")
+	OllamaAutoStart bool   // auto-pull model if not present
+
+	// Model selection — supports per-task model routing
+	// AI_MODEL: primary model for complex tasks (wallet study, discovery)
+	// AI_MODEL_FAST: cheaper model for simple tasks (post analysis, reclassify)
+	AIModel         string // primary model: claude-sonnet-4-20250514, claude-haiku-4-5-20251001, gpt-4o, llama3.1
+	AIModelFast     string // fast/cheap model for simple tasks
 	AIAnalysisInterval time.Duration
+	AIMaxTokens     int    // max response tokens (default 4096)
 }
 
 func Load() (*Config, error) {
@@ -128,8 +139,13 @@ func Load() (*Config, error) {
 
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
-		OllamaURL:       os.Getenv("OLLAMA_URL"),
-		AIModel:         envOr("AI_MODEL", "claude-sonnet-4-20250514"),
+		OllamaURL:       envOr("OLLAMA_URL", ""),
+		OllamaModel:     envOr("OLLAMA_MODEL", "llama3.1"),
+		OllamaAutoStart: envOr("OLLAMA_AUTO_PULL", "true") == "true",
+		AIProvider:      os.Getenv("AI_PROVIDER"), // explicit: "anthropic","ollama","openai"
+		AIModel:         envOr("AI_MODEL", ""),     // auto-resolved in AI engine
+		AIModelFast:     envOr("AI_MODEL_FAST", ""), // auto-resolved in AI engine
+		AIMaxTokens:     envInt("AI_MAX_TOKENS", 4096),
 		AIAnalysisInterval: time.Duration(envInt("AI_ANALYSIS_INTERVAL", 600)) * time.Second,
 
 		WashWalletMinScore:      envFloat("WASH_WALLET_MIN_SCORE", 0.4),
@@ -216,8 +232,15 @@ func (c *Config) GetExplorerKey(chain Chain) string {
 }
 
 func (c *Config) Validate() error {
-	if len(c.KOLTwitterHandles) == 0 && len(c.KOLTelegramChannels) == 0 {
-		return fmt.Errorf("no KOL targets configured (set KOL_TWITTER_HANDLES or KOL_TELEGRAM_CHANNELS)")
+	// KOL targets can be empty — they can be added via dashboard at runtime.
+	// But we should warn if no monitoring credentials are configured at all.
+	hasTwitterAuth := c.TwitterUsername != "" || c.TwitterAuthToken != ""
+	hasTelegramAuth := len(c.KOLTelegramChannels) > 0
+	hasSolana := c.HeliusAPIKey != ""
+	hasEVM := c.ExplorerKeys[ChainEthereum] != "" || c.ExplorerKeys[ChainBase] != "" || c.ExplorerKeys[ChainBSC] != ""
+
+	if !hasTwitterAuth && !hasTelegramAuth && !hasSolana && !hasEVM {
+		return fmt.Errorf("no API credentials configured — need at least one of: TWITTER credentials, HELIUS_API_KEY (Solana), or ETHERSCAN_API_KEY (EVM)")
 	}
 	return nil
 }
@@ -225,10 +248,23 @@ func (c *Config) Validate() error {
 // --- Known service addresses for wash detection ---
 
 var KnownFixedFloatAddresses = map[Chain][]string{
-	ChainSolana:   {},
-	ChainEthereum: {},
-	ChainBase:     {},
-	ChainBSC:      {},
+	ChainSolana: {
+		"FFixpaKkNRRKmRD1tFGqFrMBF26gKiNaaTPfbSdrFETS", // FixedFloat Solana hot wallet
+		"FFSoLNFqJZuxyaqGG1GXMEfLEVf5pGAfRqVAWfTormYr", // FixedFloat Solana secondary
+	},
+	ChainEthereum: {
+		"0x4E5B2e1dc63F6b91cb6Cd759936495434C7e972F", // FixedFloat ETH hot wallet
+		"0xf1dA173228fcf015F43f3eA15aBBB51f0d8f1123", // FixedFloat ETH secondary
+		"0x36928500Bc1dCd7af6a2B4008875CC336b927D57", // ChangeNow hot wallet
+		"0x0D0707963952f2fBA59dD06f2b425ace40b492Fe", // SimpleSwap
+	},
+	ChainBase: {
+		"0x4E5B2e1dc63F6b91cb6Cd759936495434C7e972F", // FixedFloat Base (same address)
+	},
+	ChainBSC: {
+		"0x4E5B2e1dc63F6b91cb6Cd759936495434C7e972F", // FixedFloat BSC (same address)
+		"0x0D0707963952f2fBA59dD06f2b425ace40b492Fe", // SimpleSwap BSC
+	},
 }
 
 var KnownBridgeContracts = map[Chain][]string{
