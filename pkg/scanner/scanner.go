@@ -28,9 +28,18 @@ func New(cfg *config.Config, store *db.Store) *Scanner {
 }
 
 // ScanWallet dispatches to the right chain scanner.
+// Prefers direct RPC (Chainstack) when available, falls back to Etherscan/Helius.
 func (s *Scanner) ScanWallet(ctx context.Context, walletID int64, address string, chain config.Chain) (int, error) {
 	if chain == config.ChainSolana {
-		return s.scanSolana(ctx, walletID, address)
+		// Prefer Helius for Solana (richer parsed data), fall back to standard RPC
+		if s.cfg.HeliusAPIKey != "" {
+			return s.scanSolana(ctx, walletID, address)
+		}
+		return s.scanSolanaViaRPC(ctx, walletID, address)
+	}
+	// For EVM: prefer RPC for token transfers (no rate limit), Etherscan for native txs
+	if s.cfg.EVMRPC[chain] != "" {
+		return s.scanEVMviaRPC(ctx, walletID, address, chain)
 	}
 	return s.scanEVM(ctx, walletID, address, chain)
 }
@@ -650,8 +659,17 @@ func (s *Scanner) identifyAddress(ctx context.Context, address string, chain con
 		}
 	}
 
-	// Etherscan contract check (EVM) — if address is a contract, it might be a service
+	// EVM contract detection — prefer RPC, fallback to Etherscan
 	if strings.HasPrefix(address, "0x") && chain != config.ChainSolana {
+		// Try RPC first (faster, no rate limit)
+		if rpcURL := s.cfg.EVMRPC[chain]; rpcURL != "" {
+			if s.isContract(ctx, rpcURL, address) {
+				return "contract"
+			}
+			return "unknown"
+		}
+
+		// Etherscan fallback
 		apiURL := s.cfg.GetExplorerURL(chain)
 		apiKey := s.cfg.GetExplorerKey(chain)
 		if apiURL != "" && apiKey != "" {
@@ -664,7 +682,6 @@ func (s *Scanner) identifyAddress(ctx context.Context, address string, chain con
 					Result string `json:"result"`
 				}
 				json.Unmarshal(body, &result)
-				// If ABI exists, it's a verified contract (likely a service)
 				if result.Status == "1" && result.Result != "Contract source code not verified" {
 					return "contract"
 				}
