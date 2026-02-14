@@ -79,78 +79,125 @@ func (s *Scanner) scanSolana(ctx context.Context, walletID int64, address string
 		return 0, fmt.Errorf("helius API key required for solana scanning")
 	}
 
-	url := fmt.Sprintf("https://api.helius.xyz/v0/addresses/%s/transactions?api-key=%s&type=SWAP&limit=100",
-		address, s.cfg.HeliusAPIKey)
-
-	body, err := s.getJSON(ctx, url)
-	if err != nil {
-		return 0, err
-	}
-
-	var txs []json.RawMessage
-	json.Unmarshal(body, &txs)
-
 	solMints := map[string]bool{
 		"So11111111111111111111111111111111111111112":  true,
-		"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": true,
-		"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB":  true,
+		"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": true, // USDC
+		"Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB":  true, // USDT
 	}
+	solPrice := s.getSolPrice(ctx)
 
 	count := 0
-	for _, raw := range txs {
-		var p struct {
-			Signature      string `json:"signature"`
-			Timestamp      int64  `json:"timestamp"`
-			Source         string `json:"source"`
-			Fee            int64  `json:"fee"`
-			FeePayer       string `json:"feePayer"`
-			TokenTransfers []struct {
-				Mint            string  `json:"mint"`
-				FromUserAccount string  `json:"fromUserAccount"`
-				ToUserAccount   string  `json:"toUserAccount"`
-				TokenAmount     float64 `json:"tokenAmount"`
-			} `json:"tokenTransfers"`
-			NativeTransfers []struct {
-				FromUserAccount string `json:"fromUserAccount"`
-				ToUserAccount   string `json:"toUserAccount"`
-				Amount          int64  `json:"amount"`
-			} `json:"nativeTransfers"`
-		}
-		if json.Unmarshal(raw, &p) != nil {
+
+	// Scan BOTH swap and transfer tx types for full coverage
+	for _, txType := range []string{"SWAP", "TRANSFER"} {
+		url := fmt.Sprintf("https://api.helius.xyz/v0/addresses/%s/transactions?api-key=%s&type=%s&limit=100",
+			address, s.cfg.HeliusAPIKey, txType)
+
+		body, err := s.getJSON(ctx, url)
+		if err != nil {
+			log.Warn().Err(err).Str("type", txType).Msg("helius fetch failed")
 			continue
 		}
 
-		tx := db.WalletTransaction{
-			WalletID:    walletID,
-			TxHash:      p.Signature,
-			Chain:       config.ChainSolana,
-			Timestamp:   time.Unix(p.Timestamp, 0),
-			Platform:    p.Source,
-			PriorityFee: float64(p.Fee),
-		}
+		var txs []json.RawMessage
+		json.Unmarshal(body, &txs)
 
-		for _, tt := range p.TokenTransfers {
-			if tt.ToUserAccount == address && !solMints[tt.Mint] {
-				tx.TxType = "swap_buy"
-				tx.TokenAddress = tt.Mint
-				tx.AmountToken = tt.TokenAmount
-			} else if tt.FromUserAccount == address && !solMints[tt.Mint] {
-				tx.TxType = "swap_sell"
-				tx.TokenAddress = tt.Mint
-				tx.AmountToken = tt.TokenAmount
+		for _, raw := range txs {
+			var p struct {
+				Signature      string `json:"signature"`
+				Timestamp      int64  `json:"timestamp"`
+				Type           string `json:"type"`
+				Source         string `json:"source"`
+				Fee            int64  `json:"fee"`
+				FeePayer       string `json:"feePayer"`
+				TokenTransfers []struct {
+					Mint            string  `json:"mint"`
+					FromUserAccount string  `json:"fromUserAccount"`
+					ToUserAccount   string  `json:"toUserAccount"`
+					TokenAmount     float64 `json:"tokenAmount"`
+				} `json:"tokenTransfers"`
+				NativeTransfers []struct {
+					FromUserAccount string `json:"fromUserAccount"`
+					ToUserAccount   string `json:"toUserAccount"`
+					Amount          int64  `json:"amount"`
+				} `json:"nativeTransfers"`
 			}
-		}
-
-		for _, nt := range p.NativeTransfers {
-			sol := float64(nt.Amount) / 1e9
-			if nt.FromUserAccount == address || nt.ToUserAccount == address {
-				tx.AmountUSD = sol * s.getSolPrice(ctx)
+			if json.Unmarshal(raw, &p) != nil {
+				continue
 			}
-		}
 
-		if tx.TxType != "" {
-			if s.store.InsertTransaction(tx) == nil {
-				count++
+			tx := db.WalletTransaction{
+				WalletID:    walletID,
+				TxHash:      p.Signature,
+				Chain:       config.ChainSolana,
+				Timestamp:   time.Unix(p.Timestamp, 0),
+				Platform:    p.Source,
+				PriorityFee: float64(p.Fee),
+			}
+
+			// For SWAP transactions: classify token buys/sells
+			if txType == "SWAP" {
+				for _, tt := range p.TokenTransfers {
+					if tt.ToUserAccount == address && !solMints[tt.Mint] {
+						tx.TxType = "swap_buy"
+						tx.TokenAddress = tt.Mint
+						tx.AmountToken = tt.TokenAmount
+					} else if tt.FromUserAccount == address && !solMints[tt.Mint] {
+						tx.TxType = "swap_sell"
+						tx.TokenAddress = tt.Mint
+						tx.AmountToken = tt.TokenAmount
+					}
+				}
+			}
+
+			// For TRANSFER transactions: classify SOL/SPL transfers
+			if txType == "TRANSFER" {
+				// SPL token transfers
+				for _, tt := range p.TokenTransfers {
+					if tt.ToUserAccount == address {
+						tx.TxType = "transfer_in"
+						tx.TokenAddress = tt.Mint
+						tx.AmountToken = tt.TokenAmount
+					} else if tt.FromUserAccount == address {
+						tx.TxType = "transfer_out"
+						tx.TokenAddress = tt.Mint
+						tx.AmountToken = tt.TokenAmount
+					}
+				}
+				// Native SOL transfers (only if no token transfer set the type)
+				if tx.TxType == "" {
+					for _, nt := range p.NativeTransfers {
+						sol := float64(nt.Amount) / 1e9
+						if sol < 0.001 {
+							continue // skip dust/fees
+						}
+						if nt.ToUserAccount == address {
+							tx.TxType = "transfer_in"
+							tx.TokenSymbol = "SOL"
+							tx.AmountToken = sol
+							tx.FromAddress = nt.FromUserAccount
+						} else if nt.FromUserAccount == address {
+							tx.TxType = "transfer_out"
+							tx.TokenSymbol = "SOL"
+							tx.AmountToken = sol
+							tx.ToAddress = nt.ToUserAccount
+						}
+					}
+				}
+			}
+
+			// Calculate USD for native SOL transfers
+			for _, nt := range p.NativeTransfers {
+				sol := float64(nt.Amount) / 1e9
+				if nt.FromUserAccount == address || nt.ToUserAccount == address {
+					tx.AmountUSD = sol * solPrice
+				}
+			}
+
+			if tx.TxType != "" {
+				if s.store.InsertTransaction(tx) == nil {
+					count++
+				}
 			}
 		}
 	}
@@ -335,7 +382,7 @@ func (s *Scanner) scanEVM(ctx context.Context, walletID int64, address string, c
 	nativePrice := s.getNativePrice(ctx, chain)
 	count := 0
 
-	// Normal txs
+	// Normal txs — extract native transfers + detect DEX interactions
 	txs, _ := s.etherscanList(ctx, apiURL, apiKey, address, "txlist")
 	for _, etx := range txs {
 		hash := str(etx, "hash")
@@ -346,25 +393,50 @@ func (s *Scanner) scanEVM(ctx context.Context, walletID int64, address string, c
 		to := str(etx, "to")
 		value := weiToEth(str(etx, "value"))
 		ts := parseUnixStr(str(etx, "timeStamp"))
+		gasPrice := weiToEth(str(etx, "gasPrice"))     // in ETH
+		gasUsed := parseFloat(str(etx, "gasUsed"))
 
 		txType := "transfer_out"
 		if strings.EqualFold(to, address) {
 			txType = "transfer_in"
 		}
 
+		// Detect DEX router interactions (swap via native ETH/BNB)
+		platform := ""
+		if dex := config.ClassifyEVMDEX(to); dex != "" {
+			platform = dex
+			if strings.EqualFold(from, address) && value > 0 {
+				txType = "swap_buy" // sending ETH to DEX = buying tokens
+			}
+		} else if dex := config.ClassifyEVMDEX(from); dex != "" {
+			platform = dex
+			if strings.EqualFold(to, address) && value > 0 {
+				txType = "swap_sell" // receiving ETH from DEX = sold tokens
+			}
+		}
+
+		// Extract priority fee (gas tip) — EIP-1559: gasPrice includes base+tip
+		// We store total gas cost as the fee fingerprint (used for bot detection)
+		priorityFee := gasPrice * gasUsed // total gas cost in ETH
+
 		if s.store.InsertTransaction(db.WalletTransaction{
 			WalletID: walletID, TxHash: hash, Chain: chain, TxType: txType,
 			TokenSymbol: native, AmountToken: value, AmountUSD: value * nativePrice,
 			FromAddress: from, ToAddress: to, Timestamp: ts,
 			BlockNumber: parseInt64(str(etx, "blockNumber")),
+			Platform:    platform,
+			PriorityFee: priorityFee,
 		}) == nil {
 			count++
 		}
 	}
 
-	// ERC-20 token transfers
+	// ERC-20 token transfers — detect swaps and extract DEX info
 	tokenTxs, _ := s.etherscanList(ctx, apiURL, apiKey, address, "tokentx")
-	stables := map[string]bool{"USDC": true, "USDT": true, "BUSD": true, "DAI": true, "WETH": true, "WBNB": true}
+	stables := map[string]bool{
+		"USDC": true, "USDT": true, "BUSD": true, "DAI": true,
+		"WETH": true, "WBNB": true, "UST": true, "FRAX": true,
+	}
 
 	for _, etx := range tokenTxs {
 		hash := str(etx, "hash")
@@ -384,16 +456,28 @@ func (s *Scanner) scanEVM(ctx context.Context, walletID int64, address string, c
 		if strings.EqualFold(from, address) {
 			txType = "transfer_out"
 			if stables[symbol] {
-				txType = "swap_buy"
+				txType = "swap_buy" // sending stables = buying tokens
 			}
 		} else if strings.EqualFold(to, address) && stables[symbol] {
-			txType = "swap_sell"
+			txType = "swap_sell" // receiving stables = sold tokens
 		}
 
-		// For stablecoins, AmountUSD ≈ AmountToken; for others, skip (no price)
+		// For stablecoins, AmountUSD ≈ AmountToken
 		amountUSD := 0.0
 		if stables[symbol] {
 			amountUSD = value
+		}
+
+		// Try to detect DEX from "from" or "to" in token transfer context
+		platform := ""
+		// In ERC-20 transfers, the "from"/"to" might not be the DEX router itself
+		// But we can check if the *other* participant is a known router
+		counterparty := to
+		if strings.EqualFold(to, address) {
+			counterparty = from
+		}
+		if dex := config.ClassifyEVMDEX(counterparty); dex != "" {
+			platform = dex
 		}
 
 		if s.store.InsertTransaction(db.WalletTransaction{
@@ -401,6 +485,45 @@ func (s *Scanner) scanEVM(ctx context.Context, walletID int64, address string, c
 			TokenAddress: str(etx, "contractAddress"), TokenSymbol: symbol,
 			AmountToken: value, AmountUSD: amountUSD, FromAddress: from, ToAddress: to,
 			Timestamp: parseUnixStr(str(etx, "timeStamp")),
+			Platform: platform,
+		}) == nil {
+			count++
+		}
+	}
+
+	// Internal transactions — catches ETH received from DEX swaps
+	// (DEX routers often send ETH via internal calls, not direct transfers)
+	internalTxs, _ := s.etherscanList(ctx, apiURL, apiKey, address, "txlistinternal")
+	for _, etx := range internalTxs {
+		hash := str(etx, "hash")
+		if hash == "" {
+			continue
+		}
+		from := str(etx, "from")
+		to := str(etx, "to")
+		value := weiToEth(str(etx, "value"))
+		if value == 0 {
+			continue
+		}
+
+		txType := "transfer_in"
+		platform := ""
+		if strings.EqualFold(to, address) {
+			// Receiving ETH via internal tx — check if from a DEX router
+			if dex := config.ClassifyEVMDEX(from); dex != "" {
+				txType = "swap_sell" // DEX router sent us ETH = we sold tokens
+				platform = dex
+			}
+		} else if strings.EqualFold(from, address) {
+			txType = "transfer_out"
+		}
+
+		if s.store.InsertTransaction(db.WalletTransaction{
+			WalletID: walletID, TxHash: hash, Chain: chain, TxType: txType,
+			TokenSymbol: native, AmountToken: value, AmountUSD: value * nativePrice,
+			FromAddress: from, ToAddress: to,
+			Timestamp: parseUnixStr(str(etx, "timeStamp")),
+			Platform:  platform,
 		}) == nil {
 			count++
 		}
@@ -505,7 +628,12 @@ func (s *Scanner) identifyAddress(ctx context.Context, address string, chain con
 		}
 	}
 
-	// Solscan label check
+	// Check known DEX routers / CEX hot wallets
+	if label := config.IdentifyKnownEVMAddress(address); label != "" {
+		return label
+	}
+
+	// Solscan label check (Solana)
 	if chain == config.ChainSolana && s.cfg.SolscanAPIKey != "" {
 		url := fmt.Sprintf("https://pro-api.solscan.io/v2.0/account/%s", address)
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -518,6 +646,28 @@ func (s *Scanner) identifyAddress(ctx context.Context, address string, chain con
 			json.NewDecoder(resp.Body).Decode(&data)
 			if data.Data.Label != "" {
 				return matchServiceLabel(data.Data.Label)
+			}
+		}
+	}
+
+	// Etherscan contract check (EVM) — if address is a contract, it might be a service
+	if strings.HasPrefix(address, "0x") && chain != config.ChainSolana {
+		apiURL := s.cfg.GetExplorerURL(chain)
+		apiKey := s.cfg.GetExplorerKey(chain)
+		if apiURL != "" && apiKey != "" {
+			url := fmt.Sprintf("%s?module=contract&action=getabi&address=%s&apikey=%s",
+				apiURL, address, apiKey)
+			body, err := s.getJSON(ctx, url)
+			if err == nil {
+				var result struct {
+					Status string `json:"status"`
+					Result string `json:"result"`
+				}
+				json.Unmarshal(body, &result)
+				// If ABI exists, it's a verified contract (likely a service)
+				if result.Status == "1" && result.Result != "Contract source code not verified" {
+					return "contract"
+				}
 			}
 		}
 	}
@@ -687,6 +837,7 @@ func parseFloat(s string) float64 {
 // ── EVM Token Buyers ────────────────────────────────────────
 
 // evmTokenBuyers fetches recent buyers of an ERC-20 token using Etherscan/Basescan token transfer API.
+// Enriches with USD amounts by looking up token price from DexScreener.
 func (s *Scanner) evmTokenBuyers(ctx context.Context, tokenAddr string, chain config.Chain) ([]TokenBuyer, error) {
 	apiURL := s.cfg.GetExplorerURL(chain)
 	apiKey := s.cfg.GetExplorerKey(chain)
@@ -712,6 +863,16 @@ func (s *Scanner) evmTokenBuyers(ctx context.Context, tokenAddr string, chain co
 		return nil, fmt.Errorf("explorer status: %s", result.Status)
 	}
 
+	// Look up token price once for all buyers (DexScreener, cached 60s)
+	dexChain := "ethereum"
+	switch chain {
+	case config.ChainBSC:
+		dexChain = "bsc"
+	case config.ChainBase:
+		dexChain = "base"
+	}
+	tokenPrice := s.getTokenPrice(ctx, dexChain, tokenAddr)
+
 	// Deduplicate buyers (wallets that received the token)
 	seen := map[string]bool{}
 	var buyers []TokenBuyer
@@ -723,9 +884,11 @@ func (s *Scanner) evmTokenBuyers(ctx context.Context, tokenAddr string, chain co
 			continue
 		}
 
-		// Skip if "to" is a known DEX router or contract
-		// A buy = the wallet received tokens FROM a DEX/router
-		// We want the "to" address as the buyer
+		// Skip known DEX routers and contracts — we want end-user wallets
+		if config.ClassifyEVMDEX(to) != "" {
+			continue
+		}
+
 		decimals := int(parseInt64(str(tx, "tokenDecimal")))
 		if decimals == 0 {
 			decimals = 18
@@ -733,10 +896,13 @@ func (s *Scanner) evmTokenBuyers(ctx context.Context, tokenAddr string, chain co
 		value := tokenValue(str(tx, "value"), decimals)
 		ts := parseUnixStr(str(tx, "timeStamp"))
 
+		// Calculate USD amount using token price
+		amountUSD := value * tokenPrice
+
 		seen[strings.ToLower(to)] = true
 		buyers = append(buyers, TokenBuyer{
 			Address:   to,
-			AmountUSD: value, // token amount, not USD (would need price lookup)
+			AmountUSD: amountUSD,
 			TxHash:    str(tx, "hash"),
 			Timestamp: ts,
 			Source:    fmt.Sprintf("from:%s", abbrev(from)),

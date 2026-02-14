@@ -294,6 +294,59 @@ var ServiceLabels = map[string]string{
 	"railgun":        "mixer",
 }
 
+// KnownEVMAddresses maps well-known contract/hot wallet addresses to their service type.
+// Used by identifyAddress() for EVM chains so we have Solscan-equivalent labeling.
+var KnownEVMAddresses = map[string]string{
+	// Uniswap
+	"0x7a250d5630b4cf539739df2c5dacb4c659f2488d": "dex:uniswap_v2",
+	"0xe592427a0aece92de3edee1f18e0157c05861564": "dex:uniswap_v3",
+	"0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45": "dex:uniswap_v3_router2",
+	"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad": "dex:uniswap_universal",
+	// PancakeSwap
+	"0x10ed43c718714eb63d5aa57b78b54704e256024e": "dex:pancakeswap_v2",
+	"0x13f4ea83d0bd40e75c8222255bc855a974568dd4": "dex:pancakeswap_v3",
+	// SushiSwap
+	"0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f": "dex:sushiswap",
+	// 1inch
+	"0x1111111254eeb25477b68fb85ed929f73a960582": "dex:1inch_v5",
+	"0x111111125421ca6dc452d289314280a0f8842a65": "dex:1inch_v6",
+	// 0x Protocol
+	"0xdef1c0ded9bec7f1a1670819833240f027b25eff": "dex:0x_exchange",
+	// Banana Gun
+	"0x3328f7f4a1d1c57c35df56bbf0c9dcafca309c49": "bot:banana_gun",
+	// Maestro
+	"0x80a64c6d7f12c47b7c66c5b4e20e72bc0011fca7": "bot:maestro",
+	// CEX Hot Wallets (Ethereum)
+	"0x28c6c06298d514db089934071355e5743bf21d60": "cex:binance",
+	"0x21a31ee1afc51d94c2efccaa2092ad1028285549": "cex:binance",
+	"0xdfd5293d8e347dfe59e90efd55b2956a1343963d": "cex:binance",
+	"0x56eddb7aa87536c09ccc2793473599fd21a8b17f": "cex:binance",
+	"0x503828976d22510aad0201ac7ec88293211d23da": "cex:coinbase",
+	"0xa9d1e08c7793af67e9d92fe308d5697fb81d3e43": "cex:coinbase",
+	"0x71660c4005ba85c37ccec55d0c4493e66fe775d3": "cex:coinbase",
+	"0x2faf487a4414fe77e2327f0bf4ae2a264a776ad2": "cex:ftx",
+	"0xf89d7b9c864f589bbf53a82105107622b35eaa40": "cex:bybit",
+	"0x1ab4973a48dc892cd9971ece8e01dcc7688f8f23": "cex:bybit",
+	"0x0d0707963952f2fba59dd06f2b425ace40b492fe": "swap_service:simpleswap",
+	"0x36928500bc1dcd7af6a2b4008875cc336b927d57": "swap_service:changenow",
+}
+
+// IdentifyKnownEVMAddress checks if an address is a known service on EVM chains.
+func IdentifyKnownEVMAddress(address string) string {
+	if label, ok := KnownEVMAddresses[strings.ToLower(address)]; ok {
+		return label
+	}
+	return ""
+}
+
+// ClassifyEVMDEX returns the DEX name from an Etherscan "to" address in a swap tx.
+func ClassifyEVMDEX(toAddr string) string {
+	if label := IdentifyKnownEVMAddress(toAddr); strings.HasPrefix(label, "dex:") {
+		return strings.TrimPrefix(label, "dex:")
+	}
+	return ""
+}
+
 // helpers
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
