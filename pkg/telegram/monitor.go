@@ -2,10 +2,13 @@ package telegram
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -15,14 +18,14 @@ import (
 	"github.com/kol-tracker/pkg/extractor"
 )
 
-// Monitor watches Telegram channels for token calls and wallet addresses.
-// Uses either MTProto (gotd/td) or Bot API polling depending on config.
-// For channels, we use an HTTP scraper against public channel web previews as fallback.
+// Monitor scrapes public Telegram channels via their web preview pages.
 type Monitor struct {
-	cfg          *config.Config
-	store        *db.Store
-	client       *http.Client
-	lastMsgIDs   map[string]int64 // channel -> last message ID
+	cfg        *config.Config
+	store      *db.Store
+	client     *http.Client
+	mu         sync.RWMutex
+	lastMsgIDs map[string]string // channel -> last msg ID
+	seenMsgs   map[string]bool
 	onTokenFound func(kolID int64, tokenAddr string, chain config.Chain, mentionTime time.Time)
 }
 
@@ -31,7 +34,8 @@ func NewMonitor(cfg *config.Config, store *db.Store) *Monitor {
 		cfg:        cfg,
 		store:      store,
 		client:     &http.Client{Timeout: 30 * time.Second},
-		lastMsgIDs: make(map[string]int64),
+		lastMsgIDs: make(map[string]string),
+		seenMsgs:   make(map[string]bool),
 	}
 }
 
@@ -39,345 +43,250 @@ func (m *Monitor) SetTokenCallback(fn func(kolID int64, tokenAddr string, chain 
 	m.onTokenFound = fn
 }
 
-// Run starts monitoring configured Telegram channels
 func (m *Monitor) Run(ctx context.Context) error {
-	if len(m.cfg.KOLTelegramChannels) == 0 {
-		log.Info().Msg("no telegram channels configured, skipping")
-		return nil
-	}
-
-	log.Info().Strs("channels", m.cfg.KOLTelegramChannels).Msg("starting telegram monitor")
-
-	// Initial fetch of recent messages
-	for _, ch := range m.cfg.KOLTelegramChannels {
-		m.fetchChannelMessages(ctx, ch)
-	}
+	log.Info().Strs("channels", m.cfg.KOLTelegramChannels).Msg("📨 telegram monitor started")
 
 	ticker := time.NewTicker(m.cfg.TelegramPollInterval)
 	defer ticker.Stop()
+
+	m.pollAll(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			for _, ch := range m.cfg.KOLTelegramChannels {
-				m.fetchChannelMessages(ctx, ch)
-			}
+			m.pollAll(ctx)
 		}
 	}
 }
 
-// fetchChannelMessages fetches recent messages from a public Telegram channel
-// using the t.me/s/ web preview (no auth required for public channels)
-func (m *Monitor) fetchChannelMessages(ctx context.Context, channel string) {
-	kol, err := m.store.GetKOLByHandle(channel)
-	if err != nil {
-		kolID, _ := m.store.UpsertKOL(channel, "", channel)
-		kol = &db.KOLProfile{ID: kolID, TelegramChannel: channel}
+// BackfillChannel fetches historical messages from a public Telegram channel.
+// Scrapes the t.me/s/ web preview which shows the last ~20 messages per page.
+// We scroll back by fetching older pages using the "before" parameter.
+func (m *Monitor) BackfillChannel(ctx context.Context, kolID int64, channel string, maxPages int) error {
+	log.Info().Str("channel", channel).Int("pages", maxPages).Msg("📨 backfilling telegram channel")
+
+	totalProcessed := 0
+	beforeID := "" // empty = latest
+
+	for page := 0; page < maxPages; page++ {
+		if ctx.Err() != nil {
+			break
+		}
+
+		messages, oldestID, err := m.fetchMessages(ctx, channel, beforeID)
+		if err != nil {
+			log.Debug().Err(err).Str("channel", channel).Msg("backfill page error")
+			break
+		}
+
+		if len(messages) == 0 {
+			break
+		}
+
+		for _, msg := range messages {
+			if m.seenMsgs[msg.ID] {
+				continue
+			}
+			m.seenMsgs[msg.ID] = true
+			m.processMessage(kolID, channel, msg)
+			totalProcessed++
+		}
+
+		if oldestID == "" || oldestID == beforeID {
+			break // no more pages
+		}
+		beforeID = oldestID
+		time.Sleep(time.Second) // rate limit
 	}
 
-	// Use Telegram's public web view for public channels
-	messages, err := m.scrapePublicChannel(ctx, channel)
-	if err != nil {
-		log.Debug().Err(err).Str("channel", channel).Msg("public channel scrape failed")
-		return
-	}
+	log.Info().Str("channel", channel).Int("processed", totalProcessed).Msg("📨 telegram backfill complete")
+	return nil
+}
 
-	for _, msg := range messages {
-		m.processMessage(kol.ID, channel, msg)
+func (m *Monitor) pollAll(ctx context.Context) {
+	m.mu.RLock()
+	channels := make([]string, len(m.cfg.KOLTelegramChannels))
+	copy(channels, m.cfg.KOLTelegramChannels)
+	m.mu.RUnlock()
+
+	for _, channel := range channels {
+		if ctx.Err() != nil {
+			return
+		}
+
+		kol, err := m.store.GetKOLByHandle(channel)
+		if err != nil {
+			kolID, _ := m.store.UpsertKOL(channel, "", channel)
+			kol = &db.KOLProfile{ID: kolID, TelegramChannel: channel}
+		}
+
+		messages, _, err := m.fetchMessages(ctx, channel, "")
+		if err != nil {
+			log.Debug().Err(err).Str("channel", channel).Msg("telegram fetch error")
+			continue
+		}
+
+		newCount := 0
+		for _, msg := range messages {
+			m.mu.RLock()
+			seen := m.seenMsgs[msg.ID]
+			m.mu.RUnlock()
+			if seen {
+				continue
+			}
+
+			m.mu.Lock()
+			m.seenMsgs[msg.ID] = true
+			if msg.ID > m.lastMsgIDs[channel] {
+				m.lastMsgIDs[channel] = msg.ID
+			}
+			m.mu.Unlock()
+
+			m.processMessage(kol.ID, channel, msg)
+			newCount++
+		}
+
+		if newCount > 0 {
+			log.Info().Str("channel", channel).Int("new", newCount).Msg("📨 polled telegram")
+		}
 	}
 }
 
 type TGMessage struct {
-	ID        int64     `json:"id"`
-	Text      string    `json:"text"`
-	Timestamp time.Time `json:"timestamp"`
+	ID        string
+	Text      string
+	Timestamp time.Time
 }
 
-// scrapePublicChannel fetches messages from t.me/s/channel_name
-// This works for public channels without any authentication
-func (m *Monitor) scrapePublicChannel(ctx context.Context, channel string) ([]TGMessage, error) {
+var (
+	msgIDRe   = regexp.MustCompile(`data-post="[^/]+/(\d+)"`)
+	msgTextRe = regexp.MustCompile(`<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>`)
+	timeRe    = regexp.MustCompile(`datetime="([^"]+)"`)
+	htmlTagRe = regexp.MustCompile(`<[^>]+>`)
+)
+
+func (m *Monitor) fetchMessages(ctx context.Context, channel string, beforeID string) ([]TGMessage, string, error) {
 	url := fmt.Sprintf("https://t.me/s/%s", channel)
+	if beforeID != "" {
+		url += fmt.Sprintf("?before=%s", beforeID)
+	}
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+		return nil, "", fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	return parseTelegramHTML(string(body), channel)
-}
+	bodyStr := string(body)
+	ids := msgIDRe.FindAllStringSubmatch(bodyStr, -1)
+	texts := msgTextRe.FindAllStringSubmatch(bodyStr, -1)
+	times := timeRe.FindAllStringSubmatch(bodyStr, -1)
 
-// parseTelegramHTML extracts messages from t.me/s/ HTML
-// This is a simplified parser - the HTML structure has
-// div.tgme_widget_message_text containing the message text
-func parseTelegramHTML(htmlContent, channel string) ([]TGMessage, error) {
 	var messages []TGMessage
+	oldestID := ""
 
-	// Quick regex-based extraction of message blocks
-	// In production, use a proper HTML parser (goquery)
-	import_re_needed := false
-	_ = import_re_needed
+	for i := 0; i < len(ids) && i < len(texts); i++ {
+		msgID := ids[i][1]
+		text := texts[i][1]
+		text = htmlTagRe.ReplaceAllString(text, " ")
+		text = html.UnescapeString(text)
+		text = strings.TrimSpace(text)
 
-	// Split by message containers
-	// Each message is in: <div class="tgme_widget_message_wrap ..." data-post="channel/msgid">
-	// The text is in: <div class="tgme_widget_message_text ...">...</div>
-	// Timestamps in: <time datetime="...">
-
-	// Simple approach: extract data-post IDs and text blocks
-	content := htmlContent
-	msgStart := 0
-	for {
-		// Find data-post attribute
-		postIdx := indexFrom(content, `data-post="`, msgStart)
-		if postIdx < 0 {
-			break
-		}
-		postStart := postIdx + len(`data-post="`)
-		postEnd := indexFrom(content, `"`, postStart)
-		if postEnd < 0 {
-			break
-		}
-		postValue := content[postStart:postEnd]
-
-		// Extract message ID from "channel/123"
-		var msgID int64
-		if parts := splitLast(postValue, "/"); parts != "" {
-			fmt.Sscanf(parts, "%d", &msgID)
-		}
-
-		// Find the message text div after this point
-		textDivStart := indexFrom(content, `class="tgme_widget_message_text"`, postEnd)
-		if textDivStart < 0 || textDivStart-postEnd > 5000 { // sanity check
-			msgStart = postEnd + 1
-			continue
-		}
-
-		// Find the opening > of this div
-		textContentStart := indexFrom(content, ">", textDivStart)
-		if textContentStart < 0 {
-			msgStart = postEnd + 1
-			continue
-		}
-		textContentStart++
-
-		// Find the closing </div>
-		textContentEnd := indexFrom(content, "</div>", textContentStart)
-		if textContentEnd < 0 {
-			msgStart = postEnd + 1
-			continue
-		}
-
-		rawText := content[textContentStart:textContentEnd]
-		// Strip HTML tags
-		text := stripHTML(rawText)
-
-		// Find timestamp
-		timeIdx := indexFrom(content, `datetime="`, postEnd)
 		var ts time.Time
-		if timeIdx > 0 && timeIdx < textContentEnd+500 {
-			tsStart := timeIdx + len(`datetime="`)
-			tsEnd := indexFrom(content, `"`, tsStart)
-			if tsEnd > 0 {
-				ts, _ = time.Parse(time.RFC3339, content[tsStart:tsEnd])
-			}
+		if i < len(times) {
+			ts, _ = time.Parse(time.RFC3339, times[i][1])
 		}
 		if ts.IsZero() {
 			ts = time.Now().UTC()
 		}
 
-		if text != "" && msgID > 0 {
-			messages = append(messages, TGMessage{
-				ID:        msgID,
-				Text:      text,
-				Timestamp: ts,
-			})
+		if text != "" {
+			messages = append(messages, TGMessage{ID: msgID, Text: text, Timestamp: ts})
 		}
 
-		msgStart = textContentEnd + 1
+		if oldestID == "" || msgID < oldestID {
+			oldestID = msgID
+		}
 	}
 
-	return messages, nil
+	return messages, oldestID, nil
 }
 
 func (m *Monitor) processMessage(kolID int64, channel string, msg TGMessage) {
-	// Skip already seen
-	if msg.ID <= m.lastMsgIDs[channel] {
-		return
-	}
-	m.lastMsgIDs[channel] = msg.ID
-
-	// Extract content
 	result := extractor.Extract(msg.Text)
 	if !result.HasContent() {
 		return
 	}
 
-	postIDStr := fmt.Sprintf("%s:%d", channel, msg.ID)
-
-	log.Info().
-		Str("channel", channel).
-		Int64("msg_id", msg.ID).
-		Int("tokens", len(result.AllTokenCAs())).
-		Int("wallets", len(result.AllAddresses())).
-		Strs("tickers", result.TokenSymbols).
-		Msg("📨 telegram message with content")
+	log.Info().Str("channel", channel).Str("msg_id", msg.ID).
+		Int("tokens", len(result.AllTokenCAs())).Msg("📨 TG message with content")
 
 	allTokenCAs := result.AllTokenCAs()
 	allAddrs := result.AllAddresses()
-	allLinks := mergeLinks(result)
+	allLinks := concatSlices(result.DexScreenerLinks, result.BirdeyeLinks, result.PumpFunLinks,
+		result.PhotonLinks, result.GmgnLinks, result.BullxLinks)
 
-	postDBID, _ := m.store.InsertPost(kolID, "telegram", postIDStr, msg.Text,
+	postID, _ := m.store.InsertPost(kolID, "telegram", msg.ID, msg.Text,
 		msg.Timestamp, allTokenCAs, allAddrs, allLinks)
 
-	// Token mentions
-	tokenCASet := make(map[string]bool)
 	for _, ca := range allTokenCAs {
-		tokenCASet[ca] = true
 		chain := extractor.ClassifyAddress(ca)
-		_ = m.store.InsertTokenMention(kolID, postDBID, ca, "", chain, msg.Timestamp)
-
+		_ = m.store.InsertTokenMention(kolID, postID, ca, "", chain, msg.Timestamp)
 		if m.onTokenFound != nil {
 			m.onTokenFound(kolID, ca, chain, msg.Timestamp)
 		}
 	}
 
 	for _, symbol := range result.TokenSymbols {
-		_ = m.store.InsertTokenMention(kolID, postDBID, "", symbol, config.ChainSolana, msg.Timestamp)
+		_ = m.store.InsertTokenMention(kolID, postID, "", symbol, config.ChainSolana, msg.Timestamp)
 	}
 
-	// Discovered wallets
+	tokenCASet := make(map[string]bool)
+	for _, ca := range allTokenCAs {
+		tokenCASet[ca] = true
+	}
 	for _, addr := range result.SolanaAddresses {
 		if !tokenCASet[addr] {
-			m.store.UpsertWallet(kolID, addr, config.ChainSolana, "from_telegram", 0.6,
-				fmt.Sprintf("telegram:%s", postIDStr))
+			m.store.UpsertWallet(kolID, addr, config.ChainSolana, "from_telegram", 0.6, fmt.Sprintf("tg:%s", msg.ID))
 		}
 	}
 	for _, addr := range result.EVMAddresses {
 		if !tokenCASet[addr] {
-			m.store.UpsertWallet(kolID, addr, config.ChainEthereum, "from_telegram", 0.6,
-				fmt.Sprintf("telegram:%s", postIDStr))
+			m.store.UpsertWallet(kolID, addr, config.ChainEthereum, "from_telegram", 0.6, fmt.Sprintf("tg:%s", msg.ID))
 		}
 	}
-
-	// Log bot signals
-	if len(result.BotSignals) > 0 {
-		botNames := make([]string, 0, len(result.BotSignals))
-		for k := range result.BotSignals {
-			botNames = append(botNames, k)
-		}
-		log.Debug().Strs("bots", botNames).Str("channel", channel).Msg("bot references in TG")
-	}
 }
 
-// helpers
-
-func indexFrom(s, substr string, start int) int {
-	if start >= len(s) {
-		return -1
-	}
-	idx := indexOf(s[start:], substr)
-	if idx < 0 {
-		return -1
-	}
-	return start + idx
-}
-
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
+// AddChannel adds a new channel to monitor at runtime.
+func (m *Monitor) AddChannel(channel string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.cfg.KOLTelegramChannels {
+		if strings.EqualFold(c, channel) {
+			return
 		}
 	}
-	return -1
+	m.cfg.KOLTelegramChannels = append(m.cfg.KOLTelegramChannels, channel)
 }
 
-func splitLast(s, sep string) string {
-	idx := -1
-	for i := len(s) - 1; i >= 0; i-- {
-		if string(s[i]) == sep {
-			idx = i
-			break
-		}
+func concatSlices(slices ...[]string) []string {
+	var r []string
+	for _, s := range slices {
+		r = append(r, s...)
 	}
-	if idx >= 0 && idx < len(s)-1 {
-		return s[idx+1:]
-	}
-	return ""
-}
-
-func stripHTML(s string) string {
-	// Replace <br> with newline
-	for _, br := range []string{"<br>", "<br/>", "<br />"} {
-		s = replaceAll(s, br, "\n")
-	}
-	// Strip all HTML tags
-	inTag := false
-	var result []byte
-	for _, c := range []byte(s) {
-		if c == '<' {
-			inTag = true
-		} else if c == '>' {
-			inTag = false
-		} else if !inTag {
-			result = append(result, c)
-		}
-	}
-	// Decode HTML entities
-	decoded := string(result)
-	decoded = replaceAll(decoded, "&amp;", "&")
-	decoded = replaceAll(decoded, "&lt;", "<")
-	decoded = replaceAll(decoded, "&gt;", ">")
-	decoded = replaceAll(decoded, "&quot;", "\"")
-	decoded = replaceAll(decoded, "&#39;", "'")
-	return trimSpace(decoded)
-}
-
-func replaceAll(s, old, new string) string {
-	for {
-		idx := indexOf(s, old)
-		if idx < 0 {
-			return s
-		}
-		s = s[:idx] + new + s[idx+len(old):]
-	}
-}
-
-func trimSpace(s string) string {
-	start, end := 0, len(s)
-	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r') {
-		start++
-	}
-	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\n' || s[end-1] == '\r') {
-		end--
-	}
-	return s[start:end]
-}
-
-func mergeLinks(r *db.ExtractionResult) []string {
-	var all []string
-	all = append(all, r.DexScreenerLinks...)
-	all = append(all, r.BirdeyeLinks...)
-	all = append(all, r.PumpFunLinks...)
-	all = append(all, r.PhotonLinks...)
-	all = append(all, r.GmgnLinks...)
-	all = append(all, r.BullxLinks...)
-	return all
-}
-
-func _unused() {
-	_ = json.Marshal
+	return r
 }

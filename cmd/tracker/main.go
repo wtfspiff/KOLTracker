@@ -45,6 +45,7 @@ func main() {
 
 	sc := scanner.New(cfg, store)
 	an := analyzer.New(cfg, store)
+	studyEngine := scanner.NewWalletStudyEngine(sc, store, cfg)
 	freshMon := monitor.NewFreshWalletMonitor(cfg, store, sc, an)
 	twitterMon := twitter.NewMonitor(cfg, store)
 	telegramMon := telegram.NewMonitor(cfg, store)
@@ -62,7 +63,8 @@ func main() {
 	go func() { <-sigCh; log.Info().Msg("shutting down..."); cancel() }()
 
 	errCh := make(chan error, 10)
-	if len(cfg.KOLTwitterHandles) > 0 { go func() { errCh <- twitterMon.Run(ctx) }() }
+	// Twitter uses private API now - always start (login happens inside)
+	go func() { errCh <- twitterMon.Run(ctx) }()
 	if len(cfg.KOLTelegramChannels) > 0 { go func() { errCh <- telegramMon.Run(ctx) }() }
 	go func() { errCh <- freshMon.Run(ctx) }()
 	go func() { errCh <- runScan(ctx, cfg, store, sc) }()
@@ -75,6 +77,7 @@ func main() {
 	}
 
 	dash := dashboard.New(store, cfg, cfg.DashboardPort)
+	dash.SetMonitors(twitterMon, telegramMon, studyEngine)
 	go func() { errCh <- dash.Run() }()
 
 	printSummary(cfg, store)

@@ -120,3 +120,59 @@ pkg/dashboard/frontend.go    → React SPA (dark terminal aesthetic)
 - v4: Added deep funding tracer for FixedFloat/bridge/mixer detection
 - v5: Added AI/LLM engine for intelligent post analysis and wallet discovery
 - v6: Added React frontend dashboard with KOL management UI
+
+## Recent Changes (v2)
+
+### Twitter Private API (imperatrona/twitter-scraper)
+- Replaced public Twitter API v2 with reverse-engineered frontend API
+- Uses `github.com/imperatrona/twitter-scraper` (MIT licensed)
+- Auth: username/password login, auth_token+ct0 cookies, or saved session cookies
+- Cookie persistence in `twitter_cookies.json` for session survival across restarts
+- No rate limits, no API key costs, real-time access to any public account's tweets
+
+### Immediate Backfill on KOL Add
+- When a KOL is added via the dashboard, the system IMMEDIATELY:
+  1. Backfills last 200 tweets from Twitter (via private API)
+  2. Backfills last 10 pages (~200 messages) from Telegram (via web scraping)
+  3. Studies all provided known wallets (deep transaction analysis)
+- All 3 jobs run as background goroutines so the API responds instantly
+- User sees a toast notification confirming background work has started
+
+### Wallet Study Engine (pkg/scanner/wallet_study.go)
+- Deep analysis when a wallet is manually added to a KOL:
+  1. Fetches full transaction history via chain scanner
+  2. Traces all direct transfers to find connected wallets
+  3. Traces funding sources (FixedFloat, bridges, mixers, CEX)
+  4. Checks cross-chain presence (same EVM address on ETH/Base/BSC)
+  5. Second-degree linked wallet discovery (friends of friends)
+  6. Co-trader detection (wallets buying same tokens in similar timeframes)
+- Triggered immediately when wallet is added via `/api/wallets/add`
+
+### Add Wallet Endpoint (POST /api/wallets/add)
+- New dedicated API endpoint for adding wallets to existing KOLs
+- Request: `{kol_id, address, chain, label}`
+- Auto-detects chain from address format (0x → EVM, else → Solana)
+- Immediately triggers WalletStudyEngine in background
+
+### Frontend Updates
+- Complete React SPA rebuild with consistent JSX/Babel
+- **Add Wallet Modal**: accessible from KOL detail view, explains AI will study the wallet
+- **Add KOL Modal**: shows note about immediate backfill of tweets + TG
+- **Toast notifications**: confirms background jobs have started
+- Auto-chain detection when typing wallet address (0x → auto-selects ETH)
+- Chain filter buttons on Wallets tab
+
+### Dashboard Wiring
+- `Dashboard.SetMonitors(twitterMon, telegramMon, studyEngine)` wires up references
+- `twitterMon.AddHandle(handle)` / `telegramMon.AddChannel(channel)` for runtime additions
+- Background goroutines with 5-10 minute timeouts for backfill/study jobs
+
+### Config Additions
+```
+TWITTER_USERNAME=       # for login
+TWITTER_PASSWORD=
+TWITTER_EMAIL=          # if email verification enabled
+TWITTER_AUTH_TOKEN=     # alternative: browser cookie
+TWITTER_CSRF_TOKEN=     # alternative: browser cookie
+TWITTER_COOKIE_FILE=    # session persistence
+```

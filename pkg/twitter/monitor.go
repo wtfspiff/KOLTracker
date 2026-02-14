@@ -3,15 +3,13 @@ package twitter
 import (
 	"context"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
-	"html"
-	"io"
-	"net/http"
-	"regexp"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
+	twitterscraper "github.com/imperatrona/twitter-scraper"
 	"github.com/rs/zerolog/log"
 
 	"github.com/kol-tracker/pkg/config"
@@ -19,27 +17,26 @@ import (
 	"github.com/kol-tracker/pkg/extractor"
 )
 
-type Tweet struct {
-	ID        string    `json:"id"`
-	Text      string    `json:"text"`
-	CreatedAt time.Time `json:"created_at"`
-	AuthorID  string    `json:"author_id"`
-}
-
+// Monitor uses the reverse-engineered Twitter frontend API (imperatrona/twitter-scraper)
+// to fetch tweets in real-time and backfill historical posts.
 type Monitor struct {
 	cfg          *config.Config
 	store        *db.Store
-	client       *http.Client
-	lastTweetIDs map[string]string // handle -> last tweet ID
+	scraper      *twitterscraper.Scraper
+	mu           sync.RWMutex
+	lastTweetIDs map[string]string // handle -> last seen tweet ID
+	seenTweets   map[string]bool   // tweet ID -> processed
 	onTokenFound func(kolID int64, tokenAddr string, chain config.Chain, mentionTime time.Time)
+	loggedIn     bool
 }
 
 func NewMonitor(cfg *config.Config, store *db.Store) *Monitor {
 	return &Monitor{
 		cfg:          cfg,
 		store:        store,
-		client:       &http.Client{Timeout: 30 * time.Second},
+		scraper:      twitterscraper.New(),
 		lastTweetIDs: make(map[string]string),
+		seenTweets:   make(map[string]bool),
 	}
 }
 
@@ -47,14 +44,86 @@ func (m *Monitor) SetTokenCallback(fn func(kolID int64, tokenAddr string, chain 
 	m.onTokenFound = fn
 }
 
-// Run starts monitoring all configured KOL twitter handles
+// Login authenticates the scraper using cookies, auth tokens, or username/password.
+func (m *Monitor) Login() error {
+	// Priority 1: Use saved cookies from file
+	if m.cfg.TwitterCookieFile != "" {
+		if data, err := os.ReadFile(m.cfg.TwitterCookieFile); err == nil {
+			var cookies []*twitterscraper.Cookie
+			if json.Unmarshal(data, &cookies) == nil && len(cookies) > 0 {
+				m.scraper.SetCookies(cookies)
+				if m.scraper.IsLoggedIn() {
+					m.loggedIn = true
+					log.Info().Msg("🐦 twitter: logged in via saved cookies")
+					return nil
+				}
+			}
+		}
+	}
+
+	// Priority 2: Use auth_token + ct0 (extracted from browser)
+	if m.cfg.TwitterAuthToken != "" && m.cfg.TwitterCSRFToken != "" {
+		m.scraper.SetAuthToken(twitterscraper.AuthToken{
+			Token:     m.cfg.TwitterAuthToken,
+			CSRFToken: m.cfg.TwitterCSRFToken,
+		})
+		if m.scraper.IsLoggedIn() {
+			m.loggedIn = true
+			m.saveCookies()
+			log.Info().Msg("🐦 twitter: logged in via auth token")
+			return nil
+		}
+	}
+
+	// Priority 3: Username + Password login
+	if m.cfg.TwitterUsername != "" && m.cfg.TwitterPassword != "" {
+		var err error
+		if m.cfg.TwitterEmail != "" {
+			err = m.scraper.Login(m.cfg.TwitterUsername, m.cfg.TwitterPassword, m.cfg.TwitterEmail)
+		} else {
+			err = m.scraper.Login(m.cfg.TwitterUsername, m.cfg.TwitterPassword)
+		}
+		if err != nil {
+			return fmt.Errorf("twitter login failed: %w", err)
+		}
+		if m.scraper.IsLoggedIn() {
+			m.loggedIn = true
+			m.saveCookies()
+			log.Info().Msg("🐦 twitter: logged in via username/password")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no twitter credentials configured (need TWITTER_USERNAME+PASSWORD or TWITTER_AUTH_TOKEN+CSRF_TOKEN)")
+}
+
+func (m *Monitor) saveCookies() {
+	if m.cfg.TwitterCookieFile == "" {
+		return
+	}
+	cookies := m.scraper.GetCookies()
+	data, err := json.Marshal(cookies)
+	if err != nil {
+		return
+	}
+	os.WriteFile(m.cfg.TwitterCookieFile, data, 0600)
+}
+
+// Run starts the real-time polling loop.
 func (m *Monitor) Run(ctx context.Context) error {
-	log.Info().Strs("handles", m.cfg.KOLTwitterHandles).Msg("starting twitter monitor")
+	if err := m.Login(); err != nil {
+		log.Error().Err(err).Msg("twitter login failed - twitter monitoring disabled")
+		// Block instead of returning error, so other goroutines keep running
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	log.Info().Strs("handles", m.cfg.KOLTwitterHandles).Msg("🐦 twitter monitor started (private API)")
 
 	ticker := time.NewTicker(m.cfg.TwitterPollInterval)
 	defer ticker.Stop()
 
-	// Initial fetch
+	// Initial poll
 	m.pollAll(ctx)
 
 	for {
@@ -67,207 +136,118 @@ func (m *Monitor) Run(ctx context.Context) error {
 	}
 }
 
+// BackfillKOL fetches historical tweets for a newly added KOL.
+// Called immediately when a KOL is added via the frontend.
+func (m *Monitor) BackfillKOL(ctx context.Context, kolID int64, handle string, maxTweets int) error {
+	if !m.loggedIn {
+		if err := m.Login(); err != nil {
+			return err
+		}
+	}
+
+	log.Info().Str("handle", handle).Int("max", maxTweets).Msg("🐦 backfilling tweets for new KOL")
+
+	count := 0
+	for tweet := range m.scraper.GetTweets(ctx, handle, maxTweets) {
+		if tweet.Error != nil {
+			log.Debug().Err(tweet.Error).Str("handle", handle).Msg("backfill tweet error")
+			continue
+		}
+
+		tweetID := tweet.ID
+		if m.seenTweets[tweetID] {
+			continue
+		}
+		m.seenTweets[tweetID] = true
+
+		ts := tweet.TimeParsed
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+
+		m.processTweet(kolID, handle, tweetID, tweet.Text, ts)
+		count++
+
+		// Rate limit: don't hammer the API
+		if count%20 == 0 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	log.Info().Str("handle", handle).Int("processed", count).Msg("🐦 backfill complete")
+	return nil
+}
+
 func (m *Monitor) pollAll(ctx context.Context) {
-	for _, handle := range m.cfg.KOLTwitterHandles {
+	m.mu.RLock()
+	handles := make([]string, len(m.cfg.KOLTwitterHandles))
+	copy(handles, m.cfg.KOLTwitterHandles)
+	m.mu.RUnlock()
+
+	for _, handle := range handles {
 		if ctx.Err() != nil {
 			return
 		}
 
 		kol, err := m.store.GetKOLByHandle(handle)
 		if err != nil {
-			// Create KOL profile if doesn't exist
 			kolID, _ := m.store.UpsertKOL(handle, handle, "")
 			kol = &db.KOLProfile{ID: kolID, TwitterHandle: handle}
 		}
 
-		tweets, err := m.fetchTweets(ctx, handle)
-		if err != nil {
-			log.Error().Err(err).Str("handle", handle).Msg("failed to fetch tweets")
-			continue
-		}
-
-		for _, tweet := range tweets {
-			m.processTweet(kol.ID, handle, tweet)
-		}
+		m.fetchNewTweets(ctx, kol.ID, handle)
 	}
 }
 
-func (m *Monitor) fetchTweets(ctx context.Context, handle string) ([]Tweet, error) {
-	// Try Twitter API v2 first
-	if m.cfg.TwitterBearerToken != "" {
-		tweets, err := m.fetchViaAPI(ctx, handle)
-		if err == nil && len(tweets) > 0 {
-			return tweets, nil
-		}
-		log.Debug().Err(err).Str("handle", handle).Msg("API fetch failed, trying nitter")
-	}
-
-	// Fallback to Nitter RSS
-	return m.fetchViaNitter(ctx, handle)
-}
-
-func (m *Monitor) fetchViaAPI(ctx context.Context, handle string) ([]Tweet, error) {
-	// Resolve user ID
-	userURL := fmt.Sprintf("https://api.twitter.com/2/users/by/username/%s", handle)
-	req, _ := http.NewRequestWithContext(ctx, "GET", userURL, nil)
-	req.Header.Set("Authorization", "Bearer "+m.cfg.TwitterBearerToken)
-
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 429 {
-		return nil, fmt.Errorf("rate limited")
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-
-	var userData struct {
-		Data struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&userData); err != nil || userData.Data.ID == "" {
-		return nil, fmt.Errorf("user not found")
-	}
-
-	// Fetch tweets
-	tweetsURL := fmt.Sprintf("https://api.twitter.com/2/users/%s/tweets?max_results=20&tweet.fields=created_at,text", userData.Data.ID)
-	if sinceID, ok := m.lastTweetIDs[handle]; ok {
-		tweetsURL += "&since_id=" + sinceID
-	}
-
-	req, _ = http.NewRequestWithContext(ctx, "GET", tweetsURL, nil)
-	req.Header.Set("Authorization", "Bearer "+m.cfg.TwitterBearerToken)
-
-	resp2, err := m.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp2.Body.Close()
-
-	if resp2.StatusCode != 200 {
-		return nil, fmt.Errorf("tweets status %d", resp2.StatusCode)
-	}
-
-	var tweetsData struct {
-		Data []struct {
-			ID        string `json:"id"`
-			Text      string `json:"text"`
-			CreatedAt string `json:"created_at"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp2.Body).Decode(&tweetsData); err != nil {
-		return nil, err
-	}
-
-	var tweets []Tweet
-	for _, t := range tweetsData.Data {
-		ts, _ := time.Parse(time.RFC3339, t.CreatedAt)
-		tweets = append(tweets, Tweet{ID: t.ID, Text: t.Text, CreatedAt: ts})
-	}
-
-	return tweets, nil
-}
-
-// Nitter RSS fallback
-type rssItem struct {
-	Title       string `xml:"title"`
-	Description string `xml:"description"`
-	Link        string `xml:"link"`
-	PubDate     string `xml:"pubDate"`
-}
-
-type rssFeed struct {
-	Channel struct {
-		Items []rssItem `xml:"item"`
-	} `xml:"channel"`
-}
-
-var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
-
-func (m *Monitor) fetchViaNitter(ctx context.Context, handle string) ([]Tweet, error) {
-	for _, instance := range m.cfg.NitterInstances {
-		url := fmt.Sprintf("%s/%s/rss", strings.TrimRight(instance, "/"), handle)
-
-		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0")
-
-		resp, err := m.client.Do(req)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			continue
-		}
-
-		var feed rssFeed
-		if err := xml.Unmarshal(body, &feed); err != nil {
-			continue
-		}
-
-		var tweets []Tweet
-		for _, item := range feed.Channel.Items {
-			text := item.Description
-			text = htmlTagRe.ReplaceAllString(text, " ")
-			text = html.UnescapeString(text)
-			text = strings.TrimSpace(text)
-
-			if text == "" && item.Title != "" {
-				text = item.Title
-			}
-
-			// Extract tweet ID from link
-			tweetID := ""
-			parts := strings.Split(strings.TrimRight(item.Link, "/"), "/")
-			if len(parts) > 0 {
-				tweetID = parts[len(parts)-1]
-				// Remove # fragment
-				if idx := strings.Index(tweetID, "#"); idx > 0 {
-					tweetID = tweetID[:idx]
-				}
-			}
-
-			ts, _ := time.Parse(time.RFC1123Z, item.PubDate)
-			if ts.IsZero() {
-				ts = time.Now().UTC()
-			}
-
-			if text != "" {
-				tweets = append(tweets, Tweet{ID: tweetID, Text: text, CreatedAt: ts})
-			}
-		}
-
-		if len(tweets) > 0 {
-			log.Info().Str("handle", handle).Int("count", len(tweets)).Str("via", instance).Msg("fetched tweets via nitter")
-			return tweets, nil
-		}
-	}
-
-	return nil, fmt.Errorf("all nitter instances failed for @%s", handle)
-}
-
-func (m *Monitor) processTweet(kolID int64, handle string, tweet Tweet) {
-	// Skip if already seen
-	if lastID, ok := m.lastTweetIDs[handle]; ok && tweet.ID <= lastID {
+func (m *Monitor) fetchNewTweets(ctx context.Context, kolID int64, handle string) {
+	if !m.loggedIn {
 		return
 	}
-	if tweet.ID > m.lastTweetIDs[handle] {
-		m.lastTweetIDs[handle] = tweet.ID
+
+	// GetTweets returns a channel, fetch latest 20
+	count := 0
+	for tweet := range m.scraper.GetTweets(ctx, handle, 20) {
+		if tweet.Error != nil {
+			log.Debug().Err(tweet.Error).Str("handle", handle).Msg("fetch error")
+			break
+		}
+
+		tweetID := tweet.ID
+
+		// Skip already seen
+		m.mu.RLock()
+		seen := m.seenTweets[tweetID]
+		lastID := m.lastTweetIDs[handle]
+		m.mu.RUnlock()
+
+		if seen || (lastID != "" && tweetID <= lastID) {
+			continue
+		}
+
+		m.mu.Lock()
+		m.seenTweets[tweetID] = true
+		if tweetID > m.lastTweetIDs[handle] {
+			m.lastTweetIDs[handle] = tweetID
+		}
+		m.mu.Unlock()
+
+		ts := tweet.TimeParsed
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+
+		m.processTweet(kolID, handle, tweetID, tweet.Text, ts)
+		count++
 	}
 
-	// Extract addresses, tokens, links
-	result := extractor.Extract(tweet.Text)
+	if count > 0 {
+		log.Info().Str("handle", handle).Int("new_tweets", count).Msg("🐦 polled")
+	}
+}
+
+// processTweet extracts wallet addresses, token CAs, and links from a tweet.
+func (m *Monitor) processTweet(kolID int64, handle string, tweetID string, text string, ts time.Time) {
+	result := extractor.Extract(text)
 
 	if !result.HasContent() {
 		return
@@ -275,69 +255,70 @@ func (m *Monitor) processTweet(kolID int64, handle string, tweet Tweet) {
 
 	log.Info().
 		Str("handle", handle).
-		Str("tweet_id", tweet.ID).
+		Str("tweet_id", tweetID).
 		Int("tokens", len(result.AllTokenCAs())).
 		Int("wallets", len(result.AllAddresses())).
 		Strs("tickers", result.TokenSymbols).
 		Msg("📱 tweet with content")
 
-	// Store the post
 	allTokenCAs := result.AllTokenCAs()
 	allAddrs := result.AllAddresses()
-	allLinks := concat(result.DexScreenerLinks, result.BirdeyeLinks, result.PumpFunLinks,
+	allLinks := concatSlices(result.DexScreenerLinks, result.BirdeyeLinks, result.PumpFunLinks,
 		result.PhotonLinks, result.GmgnLinks, result.BullxLinks)
 
-	postID, _ := m.store.InsertPost(kolID, "twitter", tweet.ID, tweet.Text,
-		tweet.CreatedAt, allTokenCAs, allAddrs, allLinks)
+	postID, _ := m.store.InsertPost(kolID, "twitter", tweetID, text, ts, allTokenCAs, allAddrs, allLinks)
 
-	// Store token mentions and trigger fresh buyer watch
+	// Token mentions → trigger fresh buyer watch
 	for _, ca := range allTokenCAs {
 		chain := extractor.ClassifyAddress(ca)
-		_ = m.store.InsertTokenMention(kolID, postID, ca, "", chain, tweet.CreatedAt)
-
+		_ = m.store.InsertTokenMention(kolID, postID, ca, "", chain, ts)
 		if m.onTokenFound != nil {
-			m.onTokenFound(kolID, ca, chain, tweet.CreatedAt)
+			m.onTokenFound(kolID, ca, chain, ts)
 		}
 	}
-
 	for _, symbol := range result.TokenSymbols {
-		_ = m.store.InsertTokenMention(kolID, postID, "", symbol, config.ChainSolana, tweet.CreatedAt)
+		_ = m.store.InsertTokenMention(kolID, postID, "", symbol, config.ChainSolana, ts)
 	}
 
-	// Store discovered wallet addresses (non-CA addresses from tweets)
+	// Discovered wallet addresses (non-CA)
 	tokenCASet := make(map[string]bool)
 	for _, ca := range allTokenCAs {
 		tokenCASet[ca] = true
 	}
-
 	for _, addr := range result.SolanaAddresses {
 		if !tokenCASet[addr] {
-			m.store.UpsertWallet(kolID, addr, config.ChainSolana, "from_tweet", 0.7,
-				fmt.Sprintf("tweet:%s", tweet.ID))
-			log.Info().Str("address", abbrev(addr)).Str("source", "tweet").Msg("🔑 potential wallet found")
+			m.store.UpsertWallet(kolID, addr, config.ChainSolana, "from_tweet", 0.7, fmt.Sprintf("tweet:%s", tweetID))
 		}
 	}
 	for _, addr := range result.EVMAddresses {
 		if !tokenCASet[addr] {
-			m.store.UpsertWallet(kolID, addr, config.ChainEthereum, "from_tweet", 0.7,
-				fmt.Sprintf("tweet:%s", tweet.ID))
+			m.store.UpsertWallet(kolID, addr, config.ChainEthereum, "from_tweet", 0.7, fmt.Sprintf("tweet:%s", tweetID))
 		}
 	}
 
-	// Store detected bot preferences
 	for botName := range result.BotSignals {
 		log.Debug().Str("bot", botName).Str("handle", handle).Msg("bot reference detected")
 	}
 }
 
-func abbrev(addr string) string {
-	if len(addr) > 12 {
-		return addr[:6] + "..." + addr[len(addr)-4:]
+// AddHandle adds a new handle to monitor at runtime (called when KOL added via frontend).
+func (m *Monitor) AddHandle(handle string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, h := range m.cfg.KOLTwitterHandles {
+		if strings.EqualFold(h, handle) {
+			return
+		}
 	}
-	return addr
+	m.cfg.KOLTwitterHandles = append(m.cfg.KOLTwitterHandles, handle)
 }
 
-func concat(slices ...[]string) []string {
+// IsLoggedIn returns whether the scraper has an active session.
+func (m *Monitor) IsLoggedIn() bool {
+	return m.loggedIn
+}
+
+func concatSlices(slices ...[]string) []string {
 	var r []string
 	for _, s := range slices {
 		r = append(r, s...)

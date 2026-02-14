@@ -15,4 +15,5 @@ require (
 	github.com/charmbracelet/bubbletea v0.27.0
 	github.com/charmbracelet/lipgloss v0.12.1
 	golang.org/x/sync v0.8.0
+	github.com/imperatrona/twitter-scraper v0.0.20
 )

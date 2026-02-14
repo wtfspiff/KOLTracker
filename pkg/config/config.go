@@ -38,6 +38,13 @@ type Config struct {
 	TwitterBearerToken string
 	NitterInstances    []string
 	TwitterPollInterval time.Duration
+	// Twitter private API (imperatrona/twitter-scraper)
+	TwitterUsername    string
+	TwitterPassword   string
+	TwitterEmail      string
+	TwitterAuthToken  string // auth_token cookie
+	TwitterCSRFToken  string // ct0 cookie
+	TwitterCookieFile string // persist sessions
 
 	// Telegram
 	TelegramAPIID   int
@@ -98,6 +105,12 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		TwitterBearerToken: os.Getenv("TWITTER_BEARER_TOKEN"),
+		TwitterUsername:    os.Getenv("TWITTER_USERNAME"),
+		TwitterPassword:    os.Getenv("TWITTER_PASSWORD"),
+		TwitterEmail:       os.Getenv("TWITTER_EMAIL"),
+		TwitterAuthToken:   os.Getenv("TWITTER_AUTH_TOKEN"),
+		TwitterCSRFToken:   os.Getenv("TWITTER_CSRF_TOKEN"),
+		TwitterCookieFile:  envOr("TWITTER_COOKIE_FILE", "twitter_cookies.json"),
 		TelegramAPIHash:    os.Getenv("TELEGRAM_API_HASH"),
 		TelegramPhone:      os.Getenv("TELEGRAM_PHONE"),
 
