@@ -1,6 +1,10 @@
 *.db
-*.db-journal
-*.db-wal
+*.sqlite
 .env
-kol-tracker
-/vendor/
+kol_tracker.db
+__debug_bin*
+vendor/
+.idea/
+.vscode/
+*.exe
+*.test
