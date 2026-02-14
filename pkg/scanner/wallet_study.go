@@ -21,14 +21,26 @@ import (
 // 4. Checks cross-chain presence (same EVM address on ETH/Base/BSC)
 // 5. Finds wallets that received from the same funding sources
 // 6. Discovers wallets that traded the same tokens in similar timeframes
+// 7. Runs AI-powered deep analysis via LLM (behavioral fingerprinting, risk assessment)
 type WalletStudyEngine struct {
-	scanner *Scanner
-	store   *db.Store
-	cfg     *config.Config
+	scanner  *Scanner
+	store    *db.Store
+	cfg      *config.Config
+	aiStudy  AIWalletStudier // interface to AI engine (avoid circular import)
+}
+
+// AIWalletStudier is implemented by ai.Engine to perform LLM-based wallet analysis.
+type AIWalletStudier interface {
+	AIWalletStudyGeneric(ctx context.Context, kolID int64, address string, chain config.Chain) (interface{}, error)
+	IsEnabled() bool
 }
 
 func NewWalletStudyEngine(sc *Scanner, store *db.Store, cfg *config.Config) *WalletStudyEngine {
 	return &WalletStudyEngine{scanner: sc, store: store, cfg: cfg}
+}
+
+func (e *WalletStudyEngine) SetAIEngine(ai AIWalletStudier) {
+	e.aiStudy = ai
 }
 
 // StudyResult contains all discoveries from analyzing a wallet.
@@ -250,6 +262,21 @@ func (e *WalletStudyEngine) StudyWallet(ctx context.Context, kolID int64, addres
 		fmt.Sprintf("Wallet study: %s found %d txs, %d linked wallets, %d cross-chain",
 			abbrev(address), result.TransactionsFound, len(result.LinkedWallets), len(result.CrossChainAddrs)),
 		"", address, "")
+
+	// ── Step 7: AI-Powered Deep Analysis ──
+	// After the scanner has collected all raw on-chain data, run the AI engine
+	// for behavioral fingerprinting, relationship inference, funding intelligence,
+	// predictive discovery, and risk assessment.
+	if e.aiStudy != nil && e.aiStudy.IsEnabled() {
+		log.Info().Str("wallet", abbrev(address)).Msg("🧠 running AI-powered deep analysis...")
+		aiResult, err := e.aiStudy.AIWalletStudyGeneric(ctx, kolID, address, chain)
+		if err != nil {
+			log.Warn().Err(err).Msg("AI wallet study failed (non-fatal)")
+		} else {
+			log.Info().Interface("ai_result_type", fmt.Sprintf("%T", aiResult)).
+				Msg("🧠 AI wallet study complete")
+		}
+	}
 
 	log.Info().Str("wallet", abbrev(address)).
 		Int("txs", result.TransactionsFound).

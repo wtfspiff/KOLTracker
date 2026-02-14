@@ -176,3 +176,98 @@ TWITTER_AUTH_TOKEN=     # alternative: browser cookie
 TWITTER_CSRF_TOKEN=     # alternative: browser cookie
 TWITTER_COOKIE_FILE=    # session persistence
 ```
+
+## AI-Powered Wallet Study Engine (pkg/ai/wallet_study.go)
+
+The wallet study is now fully AI-powered. When a wallet is added, after the basic scanner
+collects raw on-chain data, the AI engine runs 5 sequential LLM calls:
+
+### Call Sequence
+1. **Behavioral Fingerprinting** — Creates a deep trading profile: style (sniper/swing/degen),
+   risk tolerance, DEX preferences, bot usage, gas strategy, entry/exit patterns, unique
+   signatures (specific fee amounts, slippage settings), and similarity score to KOL's main wallet.
+
+2. **Relationship Analysis** — Compares the target wallet against ALL known KOL wallets.
+   Determines: same_owner, wash, sniping, funding_hub, linked_entity, or unrelated.
+   Uses behavioral similarity (not just on-chain links) for inference.
+
+3. **Funding Flow Intelligence** — Traces how the wallet was funded. Detects intentional
+   obfuscation (FixedFloat, bridges, mixers, multi-hop, time delays, split sends).
+   Maps the complete funding chain step by step.
+
+4. **Predictive Wallet Discovery** — Based on all known data, PREDICTS what other wallets
+   the KOL likely has but haven't been found yet. E.g., "This KOL likely has a Solana
+   sniping wallet — look for wallets that bought tokens X,Y,Z within seconds of LP creation."
+   Also predicts tokens the KOL will shill next.
+
+5. **Risk Assessment Synthesis** — Final synthesis of all findings. Outputs probabilities for:
+   wash trading, insider trading, pre-buying, pump-and-dump. Generates critical/warning alerts
+   for high-risk findings.
+
+### Integration Flow
+```
+User adds wallet via frontend
+  → POST /api/wallets/add
+  → Background goroutine starts
+  → WalletStudyEngine.StudyWallet()
+    → Step 1-6: Basic scanner (tx history, linked wallets, cross-chain, funding)
+    → Step 7: AI engine (5 LLM calls for deep analysis)
+    → Results stored in DB (updated wallet labels, alerts, confidence scores)
+  → Frontend auto-refreshes and shows new findings
+```
+
+## Estimated AI/LLM Operating Costs
+
+### Per-Operation Token Usage (estimated)
+| Operation | Input Tokens | Output Tokens | Total Tokens |
+|-----------|-------------|--------------|-------------|
+| Social Post Analysis | ~1,500 | ~500 | ~2,000 |
+| Wallet Relationship | ~2,000 | ~600 | ~2,600 |
+| Wallet Discovery | ~3,000 | ~800 | ~3,800 |
+| Wallet Reclassify | ~2,500 | ~700 | ~3,200 |
+| AI Wallet Study (5 calls) | ~8,000 | ~2,500 | ~10,500 |
+
+### Claude Sonnet 4 Pricing (default model)
+- Input: $3.00 / 1M tokens
+- Output: $15.00 / 1M tokens
+
+### Cost Per Operation
+| Operation | Cost |
+|-----------|------|
+| Single social post analysis | ~$0.012 |
+| Single wallet relationship check | ~$0.015 |
+| Full wallet discovery scan | ~$0.021 |
+| Wallet reclassification | ~$0.018 |
+| **Full AI wallet study (5 calls)** | **~$0.062** |
+
+### Monthly Cost Scenarios
+
+#### Light Usage (1-3 KOLs, hobby)
+- Social posts: ~50/day × 30 = 1,500 posts → $18/month
+- Wallet studies: ~5/month → $0.31
+- Periodic analysis (every 10 min): 144/day × 30 → complex, but many are no-ops
+- **Estimated: $20-40/month**
+
+#### Medium Usage (5-10 KOLs, semi-pro)
+- Social posts: ~200/day × 30 = 6,000 → $72/month
+- Wallet studies: ~20/month → $1.24
+- Discovery runs: 10 KOLs × 144/day × 30 → batched = ~$50/month
+- **Estimated: $80-150/month**
+
+#### Heavy Usage (20+ KOLs, professional)
+- Social posts: ~500/day × 30 = 15,000 → $180/month
+- Wallet studies: ~50/month → $3.10
+- Full periodic analysis at scale → ~$150/month
+- **Estimated: $200-400/month**
+
+### Cost Optimization Strategies (built-in)
+1. **Batch processing**: Group multiple posts into single LLM calls
+2. **Skip no-ops**: Don't analyze posts with no crypto content (extractor pre-filters)
+3. **Cooldown**: AI analysis runs on configurable interval (default: 10 min)
+4. **Cache**: Don't re-analyze already-processed posts (MarkPostProcessed)
+5. **Haiku fallback**: Use Claude Haiku ($0.25/$1.25 per 1M tokens) for simple tasks = 12x cheaper
+6. **Ollama local**: Run Llama 3.1 locally for $0/month (lower quality but free)
+
+### Free Alternative: Ollama (Local LLM)
+Set `OLLAMA_URL=http://localhost:11434` and `AI_MODEL=llama3.1` in .env.
+Requires ~16GB RAM for Llama 3.1 8B. Quality is lower but cost is $0.

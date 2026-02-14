@@ -73,6 +73,7 @@ func main() {
 	// AI Engine (optional but recommended)
 	aiEngine := ai.NewEngine(cfg, store)
 	if aiEngine.IsEnabled() {
+		studyEngine.SetAIEngine(aiEngine) // wire AI into wallet study
 		go func() { errCh <- runAIAnalysis(ctx, cfg, aiEngine) }()
 	}
 
