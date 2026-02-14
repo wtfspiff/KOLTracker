@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/kol-tracker/pkg/ai"
 	"github.com/kol-tracker/pkg/analyzer"
 	"github.com/kol-tracker/pkg/config"
 	"github.com/kol-tracker/pkg/dashboard"
@@ -66,6 +67,12 @@ func main() {
 	go func() { errCh <- freshMon.Run(ctx) }()
 	go func() { errCh <- runScan(ctx, cfg, store, sc) }()
 	go func() { errCh <- runAnalysis(ctx, cfg, store, an) }()
+
+	// AI Engine (optional but recommended)
+	aiEngine := ai.NewEngine(cfg, store)
+	if aiEngine.IsEnabled() {
+		go func() { errCh <- runAIAnalysis(ctx, cfg, aiEngine) }()
+	}
 
 	dash := dashboard.New(store, cfg, cfg.DashboardPort)
 	go func() { errCh <- dash.Run() }()
@@ -125,6 +132,30 @@ func printSummary(cfg *config.Config, store *db.Store) {
 	fmt.Printf("  Telegram:  %v\n", cfg.KOLTelegramChannels)
 	fmt.Printf("  Chains:    Solana, Ethereum, Base, BSC\n")
 	fmt.Printf("  Dashboard: http://localhost:%d\n", cfg.DashboardPort)
+	aiStatus := "❌ Disabled (set ANTHROPIC_API_KEY or OPENAI_API_KEY)"
+	if cfg.AnthropicAPIKey != "" { aiStatus = "✅ Anthropic Claude" }
+	if cfg.OpenAIAPIKey != "" { aiStatus = "✅ OpenAI" }
+	if cfg.OllamaURL != "" { aiStatus = "✅ Ollama (local)" }
+	fmt.Printf("  AI Engine: %s\n", aiStatus)
 	if stats != nil { fmt.Printf("  DB: %d KOLs, %d wallets, %d txs\n", stats["kol_profiles"], stats["tracked_wallets"], stats["wallet_transactions"]) }
 	fmt.Println(strings.Repeat("═", 60) + "\n")
+}
+
+func runAIAnalysis(ctx context.Context, cfg *config.Config, engine *ai.Engine) error {
+	// Wait for data to accumulate first
+	select { case <-ctx.Done(): return ctx.Err(); case <-time.After(60 * time.Second): }
+	log.Info().Msg("🤖 AI analysis engine starting...")
+
+	engine.RunPeriodicAnalysis(ctx)
+
+	t := time.NewTicker(cfg.AIAnalysisInterval); defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done(): return ctx.Err()
+		case <-t.C:
+			if err := engine.RunPeriodicAnalysis(ctx); err != nil {
+				log.Error().Err(err).Msg("AI analysis error")
+			}
+		}
+	}
 }

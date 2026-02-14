@@ -84,6 +84,13 @@ type Config struct {
 
 	// Dashboard
 	DashboardPort int
+
+	// AI / LLM
+	AnthropicAPIKey string
+	OpenAIAPIKey    string
+	OllamaURL       string
+	AIModel         string
+	AIAnalysisInterval time.Duration
 }
 
 func Load() (*Config, error) {
@@ -105,6 +112,12 @@ func Load() (*Config, error) {
 
 		DBPath:        envOr("DB_PATH", "kol_tracker.db"),
 		DashboardPort: envInt("DASHBOARD_PORT", 8080),
+
+		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
+		OpenAIAPIKey:    os.Getenv("OPENAI_API_KEY"),
+		OllamaURL:       os.Getenv("OLLAMA_URL"),
+		AIModel:         envOr("AI_MODEL", "claude-sonnet-4-20250514"),
+		AIAnalysisInterval: time.Duration(envInt("AI_ANALYSIS_INTERVAL", 600)) * time.Second,
 
 		WashWalletMinScore:      envFloat("WASH_WALLET_MIN_SCORE", 0.4),
 		AmountMatchTolerancePct: envFloat("AMOUNT_MATCH_TOLERANCE_PCT", 3.0),

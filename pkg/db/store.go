@@ -586,3 +586,50 @@ func (s *Store) GetStats() (map[string]int64, error) {
 
 	return stats, nil
 }
+
+func (s *Store) GetKOLByID(id int64) (*KOLProfile, error) {
+	var k KOLProfile
+	err := s.db.QueryRow(
+		"SELECT id, name, COALESCE(twitter_handle,''), COALESCE(telegram_channel,''), COALESCE(notes,''), created_at FROM kol_profiles WHERE id=?",
+		id).Scan(&k.ID, &k.Name, &k.TwitterHandle, &k.TelegramChannel, &k.Notes, &k.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &k, nil
+}
+
+func (s *Store) GetPostsForKOL(kolID int64, limit int) ([]SocialPost, error) {
+	rows, err := s.db.Query(`SELECT id, kol_id, platform, post_id, content, posted_at, extracted_tokens, extracted_wallets, extracted_links, processed FROM social_posts WHERE kol_id=? ORDER BY posted_at DESC LIMIT ?`, kolID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var posts []SocialPost
+	for rows.Next() {
+		var p SocialPost
+		if err := rows.Scan(&p.ID, &p.KOLID, &p.Platform, &p.PostID, &p.Content, &p.PostedAt, &p.ExtractedTokens, &p.ExtractedWallets, &p.ExtractedLinks, &p.Processed); err != nil {
+			continue
+		}
+		posts = append(posts, p)
+	}
+	return posts, nil
+}
+
+func (s *Store) GetWashCandidatesForKOL(kolID int64) ([]WashWalletCandidate, error) {
+	rows, err := s.db.Query(`SELECT id, address, chain, COALESCE(funded_by,''), COALESCE(funding_source_type,'unknown'), funding_amount, COALESCE(funding_token,''), COALESCE(funding_tx,''), first_seen, bought_same_token, timing_match, amount_pattern_match, bot_signature_match, confidence_score, linked_kol_id, status, COALESCE(notes,'') FROM wash_wallet_candidates WHERE linked_kol_id=? ORDER BY confidence_score DESC`, kolID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var candidates []WashWalletCandidate
+	for rows.Next() {
+		var c WashWalletCandidate
+		var chain string
+		if err := rows.Scan(&c.ID, &c.Address, &chain, &c.FundedBy, &c.FundingSourceType, &c.FundingAmount, &c.FundingToken, &c.FundingTx, &c.FirstSeen, &c.BoughtSameToken, &c.TimingMatch, &c.AmountPatternMatch, &c.BotSignatureMatch, &c.ConfidenceScore, &c.LinkedKOLID, &c.Status, &c.Notes); err != nil {
+			continue
+		}
+		c.Chain = config.Chain(chain)
+		candidates = append(candidates, c)
+	}
+	return candidates, nil
+}
